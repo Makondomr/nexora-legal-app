@@ -1,0 +1,5 @@
+nexora.db
+.env
+__pycache__/
+*.pyc
+migrate_sqlite_to_postgres.py
