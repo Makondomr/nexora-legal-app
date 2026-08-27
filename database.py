@@ -35,7 +35,10 @@ class PGCursorCompat:
         is_insert = bool(re.match(r"^\s*INSERT\b", translated, re.I))
         if is_insert and not re.search(r"\bRETURNING\b", translated, re.I):
             translated = translated.rstrip().rstrip(";") + " RETURNING id"
-        self.raw.execute(translated, params or ())
+        if params is None:
+            self.raw.execute(translated)
+        else:
+            self.raw.execute(translated, params)
         if is_insert:
             row = self.raw.fetchone()
             if row:
