@@ -549,6 +549,74 @@ def init_db():
     _add_column_if_missing(conn, "invoices", "fees_subtotal", "REAL DEFAULT 0")
     _add_column_if_missing(conn, "invoices", "disbursement_total", "REAL DEFAULT 0")
 
+    # Firm lifecycle: additive, non-destructive migrations.
+    _add_column_if_missing(conn, "organizations", "status", "TEXT DEFAULT 'ACTIVE'")
+    _add_column_if_missing(conn, "organizations", "approved_at", "TIMESTAMP")
+    _add_column_if_missing(conn, "organizations", "approved_by", "BIGINT")
+    _add_column_if_missing(conn, "organizations", "rejection_reason", "TEXT")
+    _add_column_if_missing(conn, "organizations", "suspended_at", "TIMESTAMP")
+    conn.execute("""
+        UPDATE organizations
+        SET status='ACTIVE'
+        WHERE status IS NULL OR TRIM(status)=''
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS super_admin_users (
+            id BIGSERIAL PRIMARY KEY,
+            name TEXT NOT NULL,
+            cell TEXT UNIQUE NOT NULL,
+            active INTEGER DEFAULT 1,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_login_at TIMESTAMP
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS platform_subscriptions (
+            id BIGSERIAL PRIMARY KEY,
+            org_id BIGINT UNIQUE NOT NULL,
+            package_name TEXT DEFAULT 'Standard',
+            monthly_fee DOUBLE PRECISION DEFAULT 0,
+            status TEXT DEFAULT 'Trial',
+            start_date TEXT,
+            next_billing_date TEXT,
+            notes TEXT,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(org_id) REFERENCES organizations(id)
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS support_queries (
+            id BIGSERIAL PRIMARY KEY,
+            org_id BIGINT NOT NULL,
+            user_id BIGINT,
+            subject TEXT NOT NULL,
+            description TEXT NOT NULL,
+            priority TEXT DEFAULT 'Normal',
+            status TEXT DEFAULT 'Open',
+            admin_notes TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(org_id) REFERENCES organizations(id),
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS platform_audit_log (
+            id BIGSERIAL PRIMARY KEY,
+            super_admin_id BIGINT,
+            action TEXT NOT NULL,
+            org_id BIGINT,
+            details TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(super_admin_id) REFERENCES super_admin_users(id),
+            FOREIGN KEY(org_id) REFERENCES organizations(id)
+        )
+    """)
+
     # Ensure both new and existing firms have Nexora's standard
     # matter types and services. Existing firm-defined records are
     # preserved because the inserts use each table's UNIQUE rule.
@@ -587,8 +655,13 @@ def register_new_firm(firm_name, admin_name, admin_cell):
         firm_number = _next_firm_number(conn.cursor())
 
         cur = conn.execute("""
-            INSERT INTO organizations(name, firm_number, registered_cell)
-            VALUES (?, ?, ?)
+            INSERT INTO organizations(
+                name,
+                firm_number,
+                registered_cell,
+                status
+            )
+            VALUES (?, ?, ?, 'PENDING')
         """, (firm_name, firm_number, admin_cell))
 
         org_id = cur.lastrowid
@@ -640,6 +713,7 @@ def register_new_firm(firm_name, admin_name, admin_cell):
             "attorney_level": "Director",
             "practitioner_type": "Director",
             "practitioner_type_id": practitioner_type_id,
+            "organization_status": "PENDING",
         }
 
     except Exception as e:
@@ -657,6 +731,7 @@ def authenticate_user(firm_number, cell):
         SELECT
             u.*,
             o.name AS firm_name,
+            o.status AS organization_status,
             pt.name AS practitioner_type
         FROM users u
         JOIN organizations o ON o.id=u.org_id
@@ -687,6 +762,7 @@ def get_user(user_id):
         SELECT
             u.*,
             o.name AS firm_name,
+            o.status AS organization_status,
             pt.name AS practitioner_type
         FROM users u
         JOIN organizations o ON o.id=u.org_id
@@ -2279,3 +2355,489 @@ if __name__ == "__main__":
     init_db()
     print("Nexora database ready:")
     print(os.path.abspath(DB_NAME))
+
+
+# ============================================================
+# PLATFORM / SUPER ADMIN (PostgreSQL)
+# Ported from the tested SQLite implementation.
+# ============================================================
+
+def ensure_super_admin(name, cell):
+    """Create or refresh the one platform-level Super Admin from secure config."""
+    name = str(name or "Nexora Super Admin").strip()
+    cell = normalize_cell(cell)
+    if not cell:
+        return None
+
+    conn = get_connection()
+    try:
+        existing = conn.execute(
+            "SELECT * FROM super_admin_users WHERE cell=? LIMIT 1",
+            (cell,)
+        ).fetchone()
+
+        if existing:
+            conn.execute("""
+                UPDATE super_admin_users
+                SET name=?, active=1
+                WHERE id=?
+            """, (name, existing["id"]))
+            conn.commit()
+            return get_super_admin(existing["id"])
+
+        cur = conn.execute("""
+            INSERT INTO super_admin_users(name, cell, active)
+            VALUES (?, ?, 1)
+        """, (name, cell))
+        conn.commit()
+        return get_super_admin(cur.lastrowid)
+    finally:
+        conn.close()
+
+def get_super_admin(super_admin_id):
+    conn = get_connection()
+    row = conn.execute("""
+        SELECT * FROM super_admin_users
+        WHERE id=? AND active=1
+        LIMIT 1
+    """, (super_admin_id,)).fetchone()
+    conn.close()
+    return row_to_dict(row)
+
+def get_super_admin_by_cell(cell):
+    conn = get_connection()
+    row = conn.execute("""
+        SELECT * FROM super_admin_users
+        WHERE cell=? AND active=1
+        LIMIT 1
+    """, (normalize_cell(cell),)).fetchone()
+    conn.close()
+    return row_to_dict(row)
+
+def mark_super_admin_login(super_admin_id):
+    conn = get_connection()
+    conn.execute("""
+        UPDATE super_admin_users
+        SET last_login_at=?
+        WHERE id=?
+    """, (
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        super_admin_id
+    ))
+    conn.commit()
+    conn.close()
+
+def _platform_audit(super_admin_id, action, org_id=None, details=""):
+    conn = get_connection()
+    conn.execute("""
+        INSERT INTO platform_audit_log(
+            super_admin_id, action, org_id, details
+        )
+        VALUES (?, ?, ?, ?)
+    """, (super_admin_id, action, org_id, str(details or "")))
+    conn.commit()
+    conn.close()
+
+def list_platform_audit(limit=200):
+    conn = get_connection()
+    rows = conn.execute("""
+        SELECT
+            a.*,
+            s.name AS super_admin_name,
+            o.name AS firm_name,
+            o.firm_number
+        FROM platform_audit_log a
+        LEFT JOIN super_admin_users s ON s.id=a.super_admin_id
+        LEFT JOIN organizations o ON o.id=a.org_id
+        ORDER BY a.id DESC
+        LIMIT ?
+    """, (int(limit),)).fetchall()
+    conn.close()
+    return rows_to_dicts(rows)
+
+def list_platform_firms(status=None):
+    conn = get_connection()
+    sql = """
+        SELECT
+            o.*,
+            (
+                SELECT COUNT(*)
+                FROM users u
+                WHERE u.org_id=o.id AND u.active=1
+            ) AS active_users,
+            s.package_name,
+            s.monthly_fee,
+            s.status AS subscription_status,
+            s.start_date,
+            s.next_billing_date
+        FROM organizations o
+        LEFT JOIN platform_subscriptions s ON s.org_id=o.id
+    """
+    params = []
+    if status:
+        sql += " WHERE o.status=?"
+        params.append(str(status).upper())
+    sql += " ORDER BY o.id DESC"
+    rows = conn.execute(sql, params).fetchall()
+    conn.close()
+    return rows_to_dicts(rows)
+
+def get_platform_firm(org_id):
+    conn = get_connection()
+    row = conn.execute("""
+        SELECT
+            o.*,
+            s.package_name,
+            s.monthly_fee,
+            s.status AS subscription_status,
+            s.start_date,
+            s.next_billing_date,
+            s.notes AS subscription_notes
+        FROM organizations o
+        LEFT JOIN platform_subscriptions s ON s.org_id=o.id
+        WHERE o.id=?
+        LIMIT 1
+    """, (org_id,)).fetchone()
+    conn.close()
+    return row_to_dict(row)
+
+def list_platform_firm_users(org_id):
+    conn = get_connection()
+    rows = conn.execute("""
+        SELECT
+            u.id,
+            u.name,
+            u.cell,
+            u.role,
+            u.active,
+            u.created_at,
+            pt.name AS practitioner_type
+        FROM users u
+        LEFT JOIN practitioner_types pt ON pt.id=u.practitioner_type_id
+        WHERE u.org_id=?
+        ORDER BY u.id
+    """, (org_id,)).fetchall()
+    conn.close()
+    return rows_to_dicts(rows)
+
+def approve_firm(org_id, super_admin_id):
+    conn = get_connection()
+    try:
+        firm = conn.execute(
+            "SELECT * FROM organizations WHERE id=?",
+            (org_id,)
+        ).fetchone()
+        if not firm:
+            raise ValueError("Firm not found.")
+
+        conn.execute("""
+            UPDATE organizations
+            SET status='ACTIVE',
+                approved_at=?,
+                approved_by=?,
+                rejection_reason=NULL,
+                suspended_at=NULL
+            WHERE id=?
+        """, (
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            super_admin_id,
+            org_id
+        ))
+
+        conn.execute("""
+            INSERT OR IGNORE INTO platform_subscriptions(
+                org_id, package_name, monthly_fee, status, start_date
+            )
+            VALUES (?, 'Standard', 0, 'Trial', ?)
+        """, (
+            org_id,
+            date.today().isoformat()
+        ))
+
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        conn.close()
+        raise
+    conn.close()
+
+    _platform_audit(
+        super_admin_id,
+        "APPROVE_FIRM",
+        org_id,
+        f"Approved {firm['firm_number']} - {firm['name']}"
+    )
+    return get_platform_firm(org_id)
+
+def reject_firm(org_id, super_admin_id, reason=""):
+    conn = get_connection()
+    firm = conn.execute(
+        "SELECT * FROM organizations WHERE id=?",
+        (org_id,)
+    ).fetchone()
+    if not firm:
+        conn.close()
+        raise ValueError("Firm not found.")
+
+    conn.execute("""
+        UPDATE organizations
+        SET status='REJECTED',
+            rejection_reason=?,
+            suspended_at=NULL
+        WHERE id=?
+    """, (str(reason or "").strip(), org_id))
+    conn.commit()
+    conn.close()
+    _platform_audit(super_admin_id, "REJECT_FIRM", org_id, reason)
+    return get_platform_firm(org_id)
+
+def suspend_firm(org_id, super_admin_id, reason=""):
+    conn = get_connection()
+    firm = conn.execute(
+        "SELECT * FROM organizations WHERE id=?",
+        (org_id,)
+    ).fetchone()
+    if not firm:
+        conn.close()
+        raise ValueError("Firm not found.")
+
+    conn.execute("""
+        UPDATE organizations
+        SET status='SUSPENDED',
+            suspended_at=?,
+            rejection_reason=?
+        WHERE id=?
+    """, (
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        str(reason or "").strip(),
+        org_id
+    ))
+    conn.commit()
+    conn.close()
+    _platform_audit(super_admin_id, "SUSPEND_FIRM", org_id, reason)
+    return get_platform_firm(org_id)
+
+def reactivate_firm(org_id, super_admin_id):
+    conn = get_connection()
+    conn.execute("""
+        UPDATE organizations
+        SET status='ACTIVE',
+            suspended_at=NULL,
+            rejection_reason=NULL
+        WHERE id=?
+    """, (org_id,))
+    conn.commit()
+    conn.close()
+    _platform_audit(super_admin_id, "REACTIVATE_FIRM", org_id, "")
+    return get_platform_firm(org_id)
+
+def upsert_platform_subscription(
+    org_id,
+    super_admin_id,
+    package_name,
+    monthly_fee,
+    status,
+    start_date=None,
+    next_billing_date=None,
+    notes=""
+):
+    conn = get_connection()
+    existing = conn.execute(
+        "SELECT id FROM platform_subscriptions WHERE org_id=?",
+        (org_id,)
+    ).fetchone()
+
+    if existing:
+        conn.execute("""
+            UPDATE platform_subscriptions
+            SET package_name=?,
+                monthly_fee=?,
+                status=?,
+                start_date=?,
+                next_billing_date=?,
+                notes=?,
+                updated_at=?
+            WHERE org_id=?
+        """, (
+            str(package_name or "Standard").strip(),
+            float(monthly_fee or 0),
+            str(status or "Trial").strip(),
+            start_date,
+            next_billing_date,
+            str(notes or "").strip(),
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            org_id
+        ))
+    else:
+        conn.execute("""
+            INSERT INTO platform_subscriptions(
+                org_id,
+                package_name,
+                monthly_fee,
+                status,
+                start_date,
+                next_billing_date,
+                notes,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            org_id,
+            str(package_name or "Standard").strip(),
+            float(monthly_fee or 0),
+            str(status or "Trial").strip(),
+            start_date,
+            next_billing_date,
+            str(notes or "").strip(),
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ))
+
+    conn.commit()
+    conn.close()
+
+    _platform_audit(
+        super_admin_id,
+        "UPDATE_SUBSCRIPTION",
+        org_id,
+        f"{package_name} | {status} | R {float(monthly_fee or 0):.2f}"
+    )
+
+def platform_dashboard_metrics():
+    conn = get_connection()
+    status_rows = conn.execute("""
+        SELECT status, COUNT(*) AS total
+        FROM organizations
+        GROUP BY status
+    """).fetchall()
+    status_counts = {
+        str(r["status"] or "ACTIVE").upper(): int(r["total"])
+        for r in status_rows
+    }
+
+    active_users = conn.execute("""
+        SELECT COUNT(*) AS total
+        FROM users
+        WHERE active=1
+    """).fetchone()["total"]
+
+    mrr = conn.execute("""
+        SELECT COALESCE(SUM(monthly_fee), 0) AS total
+        FROM platform_subscriptions
+        WHERE status IN ('Active', 'Trial')
+    """).fetchone()["total"]
+
+    open_support = conn.execute("""
+        SELECT COUNT(*) AS total
+        FROM support_queries
+        WHERE status != 'Resolved'
+    """).fetchone()["total"]
+
+    conn.close()
+
+    return {
+        "total_firms": sum(status_counts.values()),
+        "pending_firms": status_counts.get("PENDING", 0),
+        "active_firms": status_counts.get("ACTIVE", 0),
+        "suspended_firms": status_counts.get("SUSPENDED", 0),
+        "rejected_firms": status_counts.get("REJECTED", 0),
+        "active_users": int(active_users or 0),
+        "mrr": float(mrr or 0),
+        "open_support": int(open_support or 0),
+    }
+
+def create_support_query(
+    org_id,
+    user_id,
+    subject,
+    description,
+    priority="Normal"
+):
+    subject = str(subject or "").strip()
+    description = str(description or "").strip()
+    if not subject or not description:
+        raise ValueError("Subject and description are required.")
+
+    conn = get_connection()
+    cur = conn.execute("""
+        INSERT INTO support_queries(
+            org_id,
+            user_id,
+            subject,
+            description,
+            priority,
+            status
+        )
+        VALUES (?, ?, ?, ?, ?, 'Open')
+    """, (
+        org_id,
+        user_id,
+        subject,
+        description,
+        str(priority or "Normal")
+    ))
+    conn.commit()
+    query_id = cur.lastrowid
+    conn.close()
+    return query_id
+
+def list_support_queries(org_id=None):
+    conn = get_connection()
+    sql = """
+        SELECT
+            q.*,
+            o.name AS firm_name,
+            o.firm_number,
+            u.name AS user_name,
+            u.cell AS user_cell
+        FROM support_queries q
+        JOIN organizations o ON o.id=q.org_id
+        LEFT JOIN users u ON u.id=q.user_id
+    """
+    params = []
+    if org_id is not None:
+        sql += " WHERE q.org_id=?"
+        params.append(org_id)
+    sql += """
+        ORDER BY
+            CASE q.status
+                WHEN 'Open' THEN 1
+                WHEN 'In Progress' THEN 2
+                ELSE 3
+            END,
+            q.id DESC
+    """
+    rows = conn.execute(sql, params).fetchall()
+    conn.close()
+    return rows_to_dicts(rows)
+
+def update_support_query(query_id, super_admin_id, status, admin_notes=""):
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT org_id FROM support_queries WHERE id=?",
+        (query_id,)
+    ).fetchone()
+    if not row:
+        conn.close()
+        raise ValueError("Support query not found.")
+
+    conn.execute("""
+        UPDATE support_queries
+        SET status=?,
+            admin_notes=?,
+            updated_at=?
+        WHERE id=?
+    """, (
+        str(status or "Open"),
+        str(admin_notes or "").strip(),
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        query_id
+    ))
+    conn.commit()
+    conn.close()
+
+    _platform_audit(
+        super_admin_id,
+        "UPDATE_SUPPORT_QUERY",
+        row["org_id"],
+        f"Query #{query_id} -> {status}"
+    )
