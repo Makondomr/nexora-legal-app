@@ -288,6 +288,40 @@ def send_whatsapp_message(cell, body=None, otp_code=None):
 
 
 
+
+def send_firm_approval_whatsapp(firm):
+    account_sid = os.getenv("TWILIO_ACCOUNT_SID", "").strip()
+    auth_token = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
+    from_number = os.getenv("TWILIO_WHATSAPP_FROM", "").strip()
+    approval_content_sid = os.getenv("TWILIO_WHATSAPP_APPROVAL_CONTENT_SID", "").strip()
+
+    if not all([account_sid, auth_token, from_number, approval_content_sid]):
+        raise RuntimeError(
+            "Firm approval WhatsApp is not fully configured. "
+            "Set TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_WHATSAPP_FROM "
+            "and TWILIO_WHATSAPP_APPROVAL_CONTENT_SID."
+        )
+
+    if not firm:
+        raise RuntimeError("Approved firm details were not returned by the database.")
+
+    cell = firm.get("registered_cell") or firm.get("cell")
+    firm_number = str(firm.get("firm_number") or "").strip()
+
+    if not cell:
+        raise RuntimeError("The approved firm has no registered cellphone number.")
+    if not firm_number:
+        raise RuntimeError("The approved firm has no Firm Number.")
+
+    client = TwilioClient(account_sid, auth_token)
+    return client.messages.create(
+        from_=from_number,
+        to=normalize_whatsapp_number(cell),
+        content_sid=approval_content_sid,
+        content_variables=json.dumps({"1": firm_number}),
+    )
+
+
 def login_super_admin(user):
     st.session_state.authenticated = True
     st.session_state.is_super_admin = True
@@ -398,6 +432,7 @@ def send_login_otp(user):
     firm_number = str(user["firm_number"])
     cell = str(user["cell"])
 
+    # Use the approved WhatsApp Authentication template, exactly like Super Admin OTP.
     message = send_whatsapp_message(cell, otp_code=code)
 
     st.session_state.otp_pending_user = dict(user)
@@ -406,7 +441,6 @@ def send_login_otp(user):
     st.session_state.otp_attempts = 0
     st.session_state.otp_last_sent_at = time.time()
     return message.sid
-
 
 def verify_login_otp(code):
     user = st.session_state.get("otp_pending_user")
@@ -900,6 +934,16 @@ if not st.session_state.authenticated:
 
                     if not user:
                         st.error("Login failed. Check the Firm Number and Cellphone Number.")
+                    elif str(user.get("organization_status") or "").upper() != "ACTIVE":
+                        status = str(user.get("organization_status") or "PENDING").upper()
+                        if status == "PENDING":
+                            st.warning("This firm is still pending Nexora approval.")
+                        elif status == "SUSPENDED":
+                            st.error("This firm's Nexora access is suspended.")
+                        elif status == "REJECTED":
+                            st.error("This firm registration was not approved.")
+                        else:
+                            st.error(f"This firm cannot log in while its status is {status}.")
                     else:
                         try:
                             send_login_otp(user)
@@ -983,7 +1027,10 @@ if not st.session_state.authenticated:
                     st.write("**Role:** Admin")
                     st.write("**Practitioner Type:** Director")
 
-                    st.info("Registration complete. Use the Login tab with your Firm Number and cellphone number to receive your WhatsApp OTP.")
+                    st.info(
+                        "Registration submitted and is pending Nexora approval. "
+                        "Once approved, use the Firm Number and registered cellphone number to log in."
+                    )
                 else:
                     st.error(message)
 
