@@ -2,9 +2,17 @@ from datetime import date, datetime, timedelta
 from io import BytesIO
 import os
 import uuid
+import hashlib
+import json
+import re
+import hmac
+import secrets
+import time
 import pandas as pd
 import streamlit as st
 import database as db
+
+from twilio.rest import Client as TwilioClient
 
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER, TA_RIGHT
@@ -241,6 +249,202 @@ def save_upload(uploaded, prefix):
 
 def admin_access():
     return st.session_state.role == "Admin"
+
+
+def send_whatsapp_message(cell, body=None, otp_code=None):
+    account_sid = os.getenv("TWILIO_ACCOUNT_SID", "").strip()
+    auth_token = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
+    from_number = os.getenv("TWILIO_WHATSAPP_FROM", "").strip()
+    content_sid = os.getenv("TWILIO_WHATSAPP_CONTENT_SID", "").strip()
+
+    if not all([account_sid, auth_token, from_number, content_sid]):
+        raise RuntimeError(
+            "Twilio WhatsApp OTP is not fully configured. "
+            "Set TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, "
+            "TWILIO_WHATSAPP_FROM and TWILIO_WHATSAPP_CONTENT_SID."
+        )
+
+    # Existing callers pass the OTP inside the old body text.
+    # Extract the 6-digit code so the rest of the app does not need to change.
+    code = str(otp_code or "").strip()
+    if not code:
+        match = re.search(r"(?<!\d)(\d{6})(?!\d)", str(body or ""))
+        if match:
+            code = match.group(1)
+
+    if not re.fullmatch(r"\d{6}", code):
+        raise RuntimeError("Could not determine the 6-digit OTP for the WhatsApp template.")
+
+    client = TwilioClient(account_sid, auth_token)
+
+    message = client.messages.create(
+        from_=from_number,
+        to=normalize_whatsapp_number(cell),
+        content_sid=content_sid,
+        content_variables=json.dumps({"1": code}),
+    )
+
+    return message
+
+
+
+def login_super_admin(user):
+    st.session_state.authenticated = True
+    st.session_state.is_super_admin = True
+    st.session_state.super_admin_id = user["id"]
+    st.session_state.super_admin_name = user["name"]
+    st.session_state.super_admin_cell = user["cell"]
+    st.session_state.page = "Platform Dashboard"
+    db.mark_super_admin_login(user["id"])
+
+def clear_super_admin_otp_state():
+    for key in [
+        "super_otp_user",
+        "super_otp_hash",
+        "super_otp_expires_at",
+        "super_otp_attempts",
+        "super_otp_last_sent_at",
+    ]:
+        st.session_state.pop(key, None)
+
+def send_super_admin_otp(user):
+    code = f"{secrets.randbelow(1_000_000):06d}"
+
+    send_whatsapp_message(
+        user["cell"],
+        (
+            f"Nexora Super Admin verification code: {code}. "
+            "This code expires in 5 minutes. "
+            "Do not share this code with anyone."
+        ),
+    )
+
+    st.session_state.super_otp_user = dict(user)
+    st.session_state.super_otp_hash = _otp_digest(
+        code,
+        "NEXORA-SUPER-ADMIN",
+        str(user["cell"])
+    )
+    st.session_state.super_otp_expires_at = time.time() + 300
+    st.session_state.super_otp_attempts = 0
+    st.session_state.super_otp_last_sent_at = time.time()
+
+def verify_super_admin_otp(code):
+    user = st.session_state.get("super_otp_user")
+    expected_hash = st.session_state.get("super_otp_hash")
+    expires_at = st.session_state.get("super_otp_expires_at", 0)
+    attempts = int(st.session_state.get("super_otp_attempts", 0))
+
+    if not user or not expected_hash:
+        return False, "No active Super Admin verification code."
+
+    if time.time() > float(expires_at):
+        clear_super_admin_otp_state()
+        return False, "The verification code has expired. Request a new OTP."
+
+    if attempts >= 5:
+        clear_super_admin_otp_state()
+        return False, "Too many incorrect attempts. Request a new OTP."
+
+    entered = str(code or "").strip()
+    if not (entered.isdigit() and len(entered) == 6):
+        return False, "Enter the 6-digit verification code."
+
+    candidate = _otp_digest(
+        entered,
+        "NEXORA-SUPER-ADMIN",
+        str(user["cell"])
+    )
+
+    if not hmac.compare_digest(candidate, expected_hash):
+        st.session_state.super_otp_attempts = attempts + 1
+        remaining = 5 - st.session_state.super_otp_attempts
+        if remaining <= 0:
+            clear_super_admin_otp_state()
+            return False, "Too many incorrect attempts. Request a new OTP."
+        return False, f"Incorrect verification code. {remaining} attempt(s) remaining."
+
+    verified = user
+    clear_super_admin_otp_state()
+    login_super_admin(verified)
+    return True, "Super Admin verified."
+
+def normalize_whatsapp_number(cell):
+    """Convert common South African cellphone formats to WhatsApp E.164."""
+    raw = "".join(ch for ch in str(cell or "").strip() if ch.isdigit() or ch == "+")
+    if raw.startswith("0"):
+        raw = "+27" + raw[1:]
+    elif raw.startswith("27") and not raw.startswith("+"):
+        raw = "+" + raw
+    elif not raw.startswith("+"):
+        raw = "+" + raw
+    return f"whatsapp:{raw}"
+
+
+def _otp_digest(code, firm_number, cell):
+    secret = os.getenv("TWILIO_AUTH_TOKEN", "")
+    payload = f"{firm_number}|{cell}|{code}|{secret}".encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def clear_otp_state():
+    for key in ["otp_pending_user", "otp_hash", "otp_expires_at",
+                "otp_attempts", "otp_last_sent_at"]:
+        st.session_state.pop(key, None)
+
+
+def send_login_otp(user):
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    firm_number = str(user["firm_number"])
+    cell = str(user["cell"])
+
+    message = send_whatsapp_message(cell, otp_code=code)
+
+    st.session_state.otp_pending_user = dict(user)
+    st.session_state.otp_hash = _otp_digest(code, firm_number, cell)
+    st.session_state.otp_expires_at = time.time() + 300
+    st.session_state.otp_attempts = 0
+    st.session_state.otp_last_sent_at = time.time()
+    return message.sid
+
+
+def verify_login_otp(code):
+    user = st.session_state.get("otp_pending_user")
+    expected_hash = st.session_state.get("otp_hash")
+    expires_at = st.session_state.get("otp_expires_at", 0)
+    attempts = int(st.session_state.get("otp_attempts", 0))
+
+    if not user or not expected_hash:
+        return False, "No active verification code. Request a new OTP."
+
+    if time.time() > float(expires_at):
+        clear_otp_state()
+        return False, "The verification code has expired. Request a new OTP."
+
+    if attempts >= 5:
+        clear_otp_state()
+        return False, "Too many incorrect attempts. Request a new OTP."
+
+    entered = str(code or "").strip()
+    if not (entered.isdigit() and len(entered) == 6):
+        return False, "Enter the 6-digit verification code."
+
+    candidate = _otp_digest(
+        entered, str(user["firm_number"]), str(user["cell"])
+    )
+
+    if not hmac.compare_digest(candidate, expected_hash):
+        st.session_state.otp_attempts = attempts + 1
+        remaining = 5 - st.session_state.otp_attempts
+        if remaining <= 0:
+            clear_otp_state()
+            return False, "Too many incorrect attempts. Request a new OTP."
+        return False, f"Incorrect verification code. {remaining} attempt(s) remaining."
+
+    verified_user = user
+    clear_otp_state()
+    login_user(verified_user)
+    return True, "Verification successful."
 
 
 def generate_invoice_pdf(org_id, invoice_id):
@@ -672,47 +876,78 @@ if not st.session_state.authenticated:
     </div>
     """, unsafe_allow_html=True)
 
-    tab_login, tab_register = st.tabs(
-        ["🔐 Login", "🏢 Register New Firm"]
+    tab_login, tab_register, tab_super = st.tabs(
+        ["🔐 Login", "🏢 Register New Firm", "🛡️ Super Admin"]
     )
 
     with tab_login:
 
         st.subheader("Login")
+        otp_user = st.session_state.get("otp_pending_user")
 
-        st.caption(
-            "Use your Nexora Firm Number together with your registered cellphone number."
-        )
-
-        with st.form("login_form"):
-
-            firm_number = st.text_input(
-                "Firm Number",
-                placeholder="NEX-001"
+        if not otp_user:
+            st.caption(
+                "Enter your Nexora Firm Number and registered cellphone number. "
+                "A 6-digit verification code will be sent to your WhatsApp."
             )
 
-            cell = st.text_input(
-                "Cellphone Number",
-                placeholder="0831234567"
-            )
+            with st.form("login_form"):
+                firm_number = st.text_input("Firm Number", placeholder="NEX-001")
+                cell = st.text_input("Cellphone Number", placeholder="0831234567")
 
-            if st.form_submit_button(
-                "Login",
-                use_container_width=True
-            ):
+                if st.form_submit_button("Send WhatsApp OTP", use_container_width=True):
+                    user = db.authenticate_user(firm_number, cell)
 
-                user = db.authenticate_user(
-                    firm_number,
-                    cell
+                    if not user:
+                        st.error("Login failed. Check the Firm Number and Cellphone Number.")
+                    else:
+                        try:
+                            send_login_otp(user)
+                            st.success("Verification code sent to your registered WhatsApp number.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Could not send WhatsApp verification code: {e}")
+
+        else:
+            st.success("A 6-digit verification code was sent to your registered WhatsApp number.")
+            st.caption(f"Firm: {otp_user['firm_number']} • User: {otp_user['name']}")
+
+            with st.form("otp_verify_form"):
+                otp_code = st.text_input(
+                    "Verification Code", max_chars=6, placeholder="123456"
                 )
 
-                if user:
-                    login_user(user)
-                    st.rerun()
+                if st.form_submit_button("Verify & Login", use_container_width=True):
+                    ok, message = verify_login_otp(otp_code)
+                    if ok:
+                        st.success(message)
+                        st.rerun()
+                    else:
+                        st.error(message)
+
+            c1, c2 = st.columns(2)
+
+            with c1:
+                elapsed = time.time() - float(
+                    st.session_state.get("otp_last_sent_at", 0)
+                )
+
+                if elapsed >= 60:
+                    if st.button("Resend OTP", use_container_width=True):
+                        try:
+                            send_login_otp(otp_user)
+                            st.success("A new verification code was sent.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Could not resend WhatsApp verification code: {e}")
                 else:
-                    st.error(
-                        "Login failed. Check the Firm Number and Cellphone Number."
-                    )
+                    remaining = max(1, 60 - int(elapsed))
+                    st.caption(f"You can request a new code in {remaining} second(s).")
+
+            with c2:
+                if st.button("Use Different Login", use_container_width=True):
+                    clear_otp_state()
+                    st.rerun()
 
     with tab_register:
 
@@ -748,12 +983,576 @@ if not st.session_state.authenticated:
                     st.write("**Role:** Admin")
                     st.write("**Practitioner Type:** Director")
 
-                    login_user(data)
-                    st.rerun()
+                    st.info("Registration complete. Use the Login tab with your Firm Number and cellphone number to receive your WhatsApp OTP.")
                 else:
                     st.error(message)
 
+    with tab_super:
+
+        st.subheader("Nexora Super Admin")
+        st.caption("Super Admin access is protected by WhatsApp OTP.")
+
+        configured_cell = os.getenv("NEXORA_SUPER_ADMIN_CELL", "0837938103").strip()
+
+        # Ensure the pilot Super Admin exists in the database.
+        super_user = db.get_super_admin_by_cell(configured_cell)
+        if not super_user:
+            db.ensure_super_admin(
+                os.getenv("NEXORA_SUPER_ADMIN_NAME", "Mzamani Russell Makondo").strip(),
+                configured_cell
+            )
+            super_user = db.get_super_admin_by_cell(configured_cell)
+
+        if not super_user:
+            st.error("Could not initialise the Nexora Super Admin account.")
+        else:
+            super_otp_user = st.session_state.get("super_otp_user")
+
+            if not super_otp_user:
+                with st.form("super_admin_login_form"):
+                    super_cell = st.text_input(
+                        "Super Admin Cellphone Number",
+                        placeholder="0831234567"
+                    )
+
+                    if st.form_submit_button(
+                        "Send Super Admin OTP",
+                        use_container_width=True
+                    ):
+                        entered_cell = db.normalize_cell(super_cell)
+                        expected_cell = db.normalize_cell(configured_cell)
+
+                        if entered_cell != expected_cell:
+                            st.error("Super Admin access denied.")
+                        else:
+                            try:
+                                send_super_admin_otp(super_user)
+                                st.success("Super Admin verification code sent to WhatsApp.")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Could not send Super Admin verification code: {e}")
+            else:
+                st.success("A 6-digit Super Admin verification code was sent to your WhatsApp.")
+
+                with st.form("super_admin_otp_form"):
+                    super_code = st.text_input(
+                        "Verification Code",
+                        max_chars=6,
+                        placeholder="123456"
+                    )
+
+                    if st.form_submit_button(
+                        "Verify & Open Control Centre",
+                        use_container_width=True
+                    ):
+                        ok, message = verify_super_admin_otp(super_code)
+                        if ok:
+                            st.success(message)
+                            st.rerun()
+                        else:
+                            st.error(message)
+
+                c1, c2 = st.columns(2)
+                with c1:
+                    elapsed = time.time() - float(
+                        st.session_state.get("super_otp_last_sent_at", 0)
+                    )
+                    if elapsed >= 60:
+                        if st.button("Resend Super Admin OTP", use_container_width=True):
+                            try:
+                                send_super_admin_otp(super_user)
+                                st.success("A new Super Admin verification code was sent.")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Could not resend Super Admin verification code: {e}")
+                    else:
+                        remaining = max(1, 60 - int(elapsed))
+                        st.caption(f"You can request a new code in {remaining} second(s).")
+
+                with c2:
+                    if st.button("Cancel Super Admin Login", use_container_width=True):
+                        clear_super_admin_otp_state()
+                        st.rerun()
+
+
     st.stop()
+
+# NEXORA SUPER ADMIN CONTROL CENTRE
+# ============================================================
+
+if st.session_state.get("is_super_admin"):
+
+    super_admin_id = st.session_state.super_admin_id
+    super_admin_name = st.session_state.super_admin_name
+
+    with st.sidebar:
+        st.markdown("## 🛡️ NEXORA")
+        st.write("**Super Admin Control Centre**")
+        st.caption(f"User: {super_admin_name}")
+
+        st.divider()
+
+        super_pages = [
+            "Platform Dashboard",
+            "Pending Registrations",
+            "Firm Management",
+            "Subscriptions & Billing",
+            "Support Queries",
+            "Audit Trail",
+        ]
+
+        if st.session_state.get("page") not in super_pages:
+            st.session_state.page = "Platform Dashboard"
+
+        super_menu = st.radio(
+            "Platform Navigation",
+            super_pages,
+            index=super_pages.index(st.session_state.page),
+            label_visibility="collapsed"
+        )
+        st.session_state.page = super_menu
+
+        st.divider()
+
+        if st.button("🚪 Super Admin Logout", use_container_width=True):
+            clear_session()
+
+    st.markdown(
+        """
+        <div class="nx-hero">
+            <h1>Nexora Super Admin</h1>
+            <p>Platform Control Centre</p>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+    if super_menu == "Platform Dashboard":
+
+        st.header("Platform Dashboard")
+        metrics = db.platform_dashboard_metrics()
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Active Firms", metrics["active_firms"])
+        c2.metric("Pending Approval", metrics["pending_firms"])
+        c3.metric("Active Users", metrics["active_users"])
+        c4.metric("Open Support Queries", metrics["open_support"])
+
+        c5, c6, c7 = st.columns(3)
+        c5.metric("Suspended Firms", metrics["suspended_firms"])
+        c6.metric("Monthly Recurring Revenue", money(metrics["mrr"]))
+        c7.metric("Total Firms", metrics["total_firms"])
+
+        st.subheader("Recent Firm Registrations")
+        firms = db.list_platform_firms()
+        if firms:
+            st.dataframe(
+                pd.DataFrame([
+                    {
+                        "Firm Number": f["firm_number"],
+                        "Firm": f["name"],
+                        "Cellphone": f["registered_cell"],
+                        "Status": f["status"],
+                        "Users": f["active_users"],
+                        "Subscription": f.get("subscription_status") or "Not Set",
+                        "Monthly Fee": money(f.get("monthly_fee")),
+                        "Registered": f["created_at"],
+                    }
+                    for f in firms[:15]
+                ]),
+                use_container_width=True,
+                hide_index=True
+            )
+        else:
+            st.info("No firms registered yet.")
+
+    elif super_menu == "Pending Registrations":
+
+        st.header("Pending Firm Registrations")
+        pending_firms = db.list_platform_firms("PENDING")
+
+        if not pending_firms:
+            st.success("There are no pending firm registrations.")
+        else:
+            for firm in pending_firms:
+                with st.container(border=True):
+                    st.subheader(
+                        f"{firm['name']} — {firm['firm_number']}"
+                    )
+                    c1, c2, c3 = st.columns(3)
+                    c1.write(f"**Registered Cell:** {firm['registered_cell']}")
+                    c2.write(f"**Users:** {firm['active_users']}")
+                    c3.write(f"**Registered:** {firm['created_at']}")
+
+                    users = db.list_platform_firm_users(firm["id"])
+                    if users:
+                        st.dataframe(
+                            pd.DataFrame([
+                                {
+                                    "Name": u["name"],
+                                    "Cellphone": u["cell"],
+                                    "Role": u["role"],
+                                    "Practitioner Type": u.get("practitioner_type") or "",
+                                }
+                                for u in users
+                            ]),
+                            use_container_width=True,
+                            hide_index=True
+                        )
+
+                    approve_col, reject_col = st.columns(2)
+
+                    with approve_col:
+                        if st.button(
+                            "✅ Approve Firm",
+                            key=f"approve_firm_{firm['id']}",
+                            use_container_width=True
+                        ):
+                            try:
+                                approved = db.approve_firm(
+                                    firm["id"],
+                                    super_admin_id
+                                )
+                                try:
+                                    send_firm_approval_whatsapp(approved)
+                                    st.success(
+                                        f"{approved['firm_number']} approved and "
+                                        "Firm Number sent by WhatsApp."
+                                    )
+                                except Exception as wa_error:
+                                    st.warning(
+                                        f"Firm approved, but WhatsApp could not be sent: {wa_error}"
+                                    )
+                                st.rerun()
+                            except Exception as e:
+                                st.error(str(e))
+
+                    with reject_col:
+                        with st.form(f"reject_form_{firm['id']}"):
+                            reject_reason = st.text_input(
+                                "Reason for rejection",
+                                key=f"reject_reason_{firm['id']}"
+                            )
+                            if st.form_submit_button(
+                                "❌ Reject Registration",
+                                use_container_width=True
+                            ):
+                                try:
+                                    db.reject_firm(
+                                        firm["id"],
+                                        super_admin_id,
+                                        reject_reason
+                                    )
+                                    st.success("Registration rejected.")
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(str(e))
+
+    elif super_menu == "Firm Management":
+
+        st.header("Firm Management")
+        firms = db.list_platform_firms()
+
+        if not firms:
+            st.info("No firms registered.")
+        else:
+            firm_map = {
+                f"{f['firm_number']} — {f['name']} [{f['status']}]": f
+                for f in firms
+            }
+            selected = firm_map[
+                st.selectbox("Select Firm", list(firm_map.keys()))
+            ]
+
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Firm Number", selected["firm_number"])
+            c2.metric("Status", selected["status"])
+            c3.metric("Active Users", selected["active_users"])
+            c4.metric(
+                "Monthly Fee",
+                money(selected.get("monthly_fee"))
+            )
+
+            st.write(f"**Registered Cell:** {selected['registered_cell']}")
+            st.write(f"**Registered:** {selected['created_at']}")
+
+            users = db.list_platform_firm_users(selected["id"])
+            if users:
+                st.subheader("Firm Users")
+                st.dataframe(
+                    pd.DataFrame([
+                        {
+                            "Name": u["name"],
+                            "Cellphone": u["cell"],
+                            "Role": u["role"],
+                            "Practitioner Type": u.get("practitioner_type") or "",
+                            "Active": "Yes" if u["active"] else "No",
+                        }
+                        for u in users
+                    ]),
+                    use_container_width=True,
+                    hide_index=True
+                )
+
+            if selected["status"] == "ACTIVE":
+                with st.form("suspend_selected_firm"):
+                    reason = st.text_input("Suspension Reason")
+                    if st.form_submit_button(
+                        "Suspend Firm",
+                        use_container_width=True
+                    ):
+                        db.suspend_firm(
+                            selected["id"],
+                            super_admin_id,
+                            reason
+                        )
+                        st.success("Firm suspended.")
+                        st.rerun()
+
+            elif selected["status"] == "SUSPENDED":
+                if st.button(
+                    "Reactivate Firm",
+                    use_container_width=True
+                ):
+                    db.reactivate_firm(
+                        selected["id"],
+                        super_admin_id
+                    )
+                    st.success("Firm reactivated.")
+                    st.rerun()
+
+            elif selected["status"] == "PENDING":
+                st.info(
+                    "This firm is pending approval. Use Pending Registrations."
+                )
+
+            elif selected["status"] == "REJECTED":
+                if st.button(
+                    "Approve Previously Rejected Firm",
+                    use_container_width=True
+                ):
+                    approved = db.approve_firm(
+                        selected["id"],
+                        super_admin_id
+                    )
+                    try:
+                        send_firm_approval_whatsapp(approved)
+                    except Exception as wa_error:
+                        st.warning(
+                            f"Approved, but WhatsApp failed: {wa_error}"
+                        )
+                    st.success("Firm approved.")
+                    st.rerun()
+
+    elif super_menu == "Subscriptions & Billing":
+
+        st.header("Nexora Subscriptions & Billing")
+        firms = db.list_platform_firms()
+
+        if not firms:
+            st.info("No firms available.")
+        else:
+            firm_map = {
+                f"{f['firm_number']} — {f['name']}": f
+                for f in firms
+            }
+            selected = firm_map[
+                st.selectbox(
+                    "Firm",
+                    list(firm_map.keys()),
+                    key="subscription_firm"
+                )
+            ]
+
+            details = db.get_platform_firm(selected["id"]) or selected
+
+            with st.form("subscription_form"):
+                package_name = st.selectbox(
+                    "Package",
+                    ["Trial", "Standard", "Group", "Custom"],
+                    index=(
+                        ["Trial", "Standard", "Group", "Custom"].index(
+                            details.get("package_name")
+                        )
+                        if details.get("package_name")
+                        in ["Trial", "Standard", "Group", "Custom"]
+                        else 1
+                    )
+                )
+
+                monthly_fee = st.number_input(
+                    "Monthly Fee (R)",
+                    min_value=0.0,
+                    value=float(details.get("monthly_fee") or 0),
+                    step=50.0
+                )
+
+                subscription_status = st.selectbox(
+                    "Subscription Status",
+                    ["Trial", "Active", "Overdue", "Paused", "Cancelled"],
+                    index=(
+                        ["Trial", "Active", "Overdue", "Paused", "Cancelled"].index(
+                            details.get("subscription_status")
+                        )
+                        if details.get("subscription_status")
+                        in ["Trial", "Active", "Overdue", "Paused", "Cancelled"]
+                        else 0
+                    )
+                )
+
+                start_date_value = st.date_input(
+                    "Start Date",
+                    value=date.today()
+                )
+
+                next_billing_value = st.date_input(
+                    "Next Billing Date",
+                    value=date.today() + timedelta(days=30)
+                )
+
+                subscription_notes = st.text_area(
+                    "Subscription / Billing Notes",
+                    value=details.get("subscription_notes") or ""
+                )
+
+                if st.form_submit_button(
+                    "Save Subscription",
+                    use_container_width=True
+                ):
+                    db.upsert_platform_subscription(
+                        selected["id"],
+                        super_admin_id,
+                        package_name,
+                        monthly_fee,
+                        subscription_status,
+                        start_date_value.isoformat(),
+                        next_billing_value.isoformat(),
+                        subscription_notes
+                    )
+                    st.success("Subscription updated.")
+                    st.rerun()
+
+            st.subheader("Subscription Portfolio")
+            portfolio = db.list_platform_firms()
+            st.dataframe(
+                pd.DataFrame([
+                    {
+                        "Firm": f["name"],
+                        "Firm Number": f["firm_number"],
+                        "Firm Status": f["status"],
+                        "Package": f.get("package_name") or "Not Set",
+                        "Subscription": f.get("subscription_status") or "Not Set",
+                        "Monthly Fee": float(f.get("monthly_fee") or 0),
+                        "Next Billing": f.get("next_billing_date") or "",
+                    }
+                    for f in portfolio
+                ]),
+                use_container_width=True,
+                hide_index=True
+            )
+
+    elif super_menu == "Support Queries":
+
+        st.header("Support Queries")
+        queries = db.list_support_queries()
+
+        if not queries:
+            st.info("No support queries.")
+        else:
+            for q in queries:
+                with st.expander(
+                    f"#{q['id']} • {q['firm_number']} • {q['subject']} • {q['status']}"
+                ):
+                    st.write(f"**Firm:** {q['firm_name']}")
+                    st.write(f"**Raised by:** {q.get('user_name') or 'Unknown'}")
+                    st.write(f"**Priority:** {q['priority']}")
+                    st.write(q["description"])
+
+                    with st.form(f"support_update_{q['id']}"):
+                        status = st.selectbox(
+                            "Status",
+                            ["Open", "In Progress", "Resolved"],
+                            index=(
+                                ["Open", "In Progress", "Resolved"].index(q["status"])
+                                if q["status"] in ["Open", "In Progress", "Resolved"]
+                                else 0
+                            ),
+                            key=f"status_{q['id']}"
+                        )
+                        notes = st.text_area(
+                            "Super Admin Notes",
+                            value=q.get("admin_notes") or "",
+                            key=f"notes_{q['id']}"
+                        )
+
+                        if st.form_submit_button("Update Query"):
+                            db.update_support_query(
+                                q["id"],
+                                super_admin_id,
+                                status,
+                                notes
+                            )
+                            st.success("Support query updated.")
+                            st.rerun()
+
+    elif super_menu == "Audit Trail":
+
+        st.header("Platform Audit Trail")
+        audit = db.list_platform_audit()
+
+        if not audit:
+            st.info("No platform audit activity yet.")
+        else:
+            st.dataframe(
+                pd.DataFrame([
+                    {
+                        "Date": a["created_at"],
+                        "Action": a["action"],
+                        "Firm Number": a.get("firm_number") or "",
+                        "Firm": a.get("firm_name") or "",
+                        "Super Admin": a.get("super_admin_name") or "",
+                        "Details": a.get("details") or "",
+                    }
+                    for a in audit
+                ]),
+                use_container_width=True,
+                hide_index=True
+            )
+
+    st.stop()
+
+
+# ============================================================
+# CONTEXT
+# ============================================================
+
+user_id = st.session_state.user_id
+org_id = st.session_state.org_id
+firm_number = st.session_state.firm_number
+firm_name = st.session_state.firm_name
+user_name = st.session_state.user_name
+user_role = st.session_state.role
+user_cell = st.session_state.cell
+
+current_user = db.get_user(user_id)
+
+if not current_user:
+    clear_session()
+
+attorney_level = (
+    current_user.get("practitioner_type")
+    or current_user.get("attorney_level")
+    or ""
+)
+
+practitioner_type_id = current_user.get("practitioner_type_id")
+
+st.session_state.attorney_level = attorney_level
+st.session_state.practitioner_type_id = practitioner_type_id
+
+
+# ============================================================
+
 
 
 # ============================================================
