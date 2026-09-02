@@ -342,6 +342,28 @@ def init_db():
         )
     """)
 
+    # Service-specific SLA rates are additive and intentionally separate from the
+    # legacy practitioner-only SLA table so existing client data remains valid.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS client_sla_service_rates (
+            id BIGSERIAL PRIMARY KEY,
+            org_id BIGINT NOT NULL,
+            client_id BIGINT NOT NULL,
+            service_id BIGINT NOT NULL,
+            practitioner_type_id BIGINT NOT NULL,
+            rate DOUBLE PRECISION DEFAULT 0,
+            unit TEXT DEFAULT 'Hour',
+            active INTEGER DEFAULT 1,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP,
+            UNIQUE(org_id, client_id, service_id, practitioner_type_id),
+            FOREIGN KEY(org_id) REFERENCES organizations(id),
+            FOREIGN KEY(client_id) REFERENCES clients(id),
+            FOREIGN KEY(service_id) REFERENCES services(id),
+            FOREIGN KEY(practitioner_type_id) REFERENCES practitioner_types(id)
+        )
+    """)
+
     c.execute("""
         CREATE TABLE IF NOT EXISTS matter_types (
             id BIGSERIAL PRIMARY KEY,
@@ -1067,6 +1089,51 @@ def list_service_fees(org_id):
 # CLIENTS / SLA
 # ============================================================
 
+def _validate_sla_service_rows(conn, org_id, rows):
+    """Validate and normalize Service + Practitioner Type SLA rows."""
+    normalized = []
+    seen = set()
+
+    for row in rows or []:
+        service_id = int(row.get("service_id"))
+        practitioner_type_id = int(row.get("practitioner_type_id"))
+        rate = float(row.get("rate") or 0)
+
+        if rate <= 0:
+            raise ValueError("Every SLA rate must be greater than zero.")
+
+        service = conn.execute("""
+            SELECT id, default_unit
+            FROM services
+            WHERE id=? AND org_id=? AND active=1
+        """, (service_id, org_id)).fetchone()
+
+        if not service:
+            raise ValueError("An SLA service does not belong to this firm or is inactive.")
+
+        practitioner = conn.execute("""
+            SELECT id
+            FROM practitioner_types
+            WHERE id=? AND org_id=? AND active=1
+        """, (practitioner_type_id, org_id)).fetchone()
+
+        if not practitioner:
+            raise ValueError("An SLA practitioner type does not belong to this firm or is inactive.")
+
+        key = (service_id, practitioner_type_id)
+        if key in seen:
+            raise ValueError("The same Service + Practitioner Type combination was supplied more than once.")
+        seen.add(key)
+
+        normalized.append({
+            "service_id": service_id,
+            "practitioner_type_id": practitioner_type_id,
+            "rate": rate,
+            "unit": str(row.get("unit") or service["default_unit"] or "Hour").strip() or "Hour",
+        })
+
+    return normalized
+
 def create_client(
     org_id,
     name,
@@ -1077,11 +1144,23 @@ def create_client(
     reference="",
     notes="",
     billing_type="General",
-    sla_rates=None
+    sla_rates=None,
+    sla_service_rates=None
 ):
+    """
+    Create a client.
+
+    Backward compatibility:
+    - sla_rates keeps supporting the historical practitioner-only SLA structure.
+    - sla_service_rates is the preferred Service + Practitioner Type structure.
+    """
     name = str(name or "").strip()
+    billing_type = str(billing_type or "General").strip()
+
     if not name:
         raise ValueError("Client name is required.")
+    if billing_type not in ("General", "SLA"):
+        raise ValueError("Billing type must be General or SLA.")
 
     conn = get_connection()
 
@@ -1093,6 +1172,17 @@ def create_client(
 
         if not org:
             raise ValueError("Firm not found.")
+
+        normalized_service_rates = []
+        if billing_type == "SLA" and sla_service_rates:
+            normalized_service_rates = _validate_sla_service_rows(
+                conn, org_id, sla_service_rates
+            )
+
+        if billing_type == "SLA" and not normalized_service_rates and not sla_rates:
+            raise ValueError(
+                "Add at least one SLA Service + Practitioner Type rate before registering the client."
+            )
 
         year = date.today().year
         client_number = _next_number(
@@ -1123,17 +1213,35 @@ def create_client(
             client_number,
             name,
             client_type,
-            email,
-            phone,
-            address,
-            reference,
-            notes,
+            str(email or "").strip(),
+            str(phone or "").strip(),
+            str(address or "").strip(),
+            str(reference or "").strip(),
+            str(notes or "").strip(),
             billing_type
         ))
 
         client_id = cur.lastrowid
 
-        if billing_type == "SLA":
+        # Preferred SLA model: Service + Practitioner Type + Rate.
+        for row in normalized_service_rates:
+            conn.execute("""
+                INSERT INTO client_sla_service_rates(
+                    org_id, client_id, service_id, practitioner_type_id,
+                    rate, unit, active
+                )
+                VALUES (?, ?, ?, ?, ?, ?, 1)
+            """, (
+                org_id,
+                client_id,
+                row["service_id"],
+                row["practitioner_type_id"],
+                row["rate"],
+                row["unit"],
+            ))
+
+        # Historical SLA model remains supported for existing integrations/data.
+        if billing_type == "SLA" and sla_rates and not normalized_service_rates:
             practitioner_types = conn.execute("""
                 SELECT id FROM practitioner_types
                 WHERE org_id=? AND active=1
@@ -1144,41 +1252,23 @@ def create_client(
                     "The firm must define Practitioner Types before registering an SLA client."
                 )
 
-            if not sla_rates:
-                raise ValueError(
-                    "SLA rates are required for every practitioner type."
-                )
-
             required_ids = {int(r["id"]) for r in practitioner_types}
             supplied_ids = {int(k) for k in sla_rates.keys()}
 
             if required_ids != supplied_ids:
-                raise ValueError(
-                    "Enter an SLA rate for every active practitioner type."
-                )
+                raise ValueError("Enter an SLA rate for every active practitioner type.")
 
             for practitioner_type_id, rate in sla_rates.items():
                 rate = float(rate)
                 if rate <= 0:
-                    raise ValueError(
-                        "Every SLA practitioner type must have a rate greater than zero."
-                    )
+                    raise ValueError("Every SLA practitioner type must have a rate greater than zero.")
 
                 conn.execute("""
                     INSERT INTO client_sla_rates(
-                        org_id,
-                        client_id,
-                        practitioner_type_id,
-                        rate,
-                        unit
+                        org_id, client_id, practitioner_type_id, rate, unit
                     )
                     VALUES (?, ?, ?, ?, 'Hour')
-                """, (
-                    org_id,
-                    client_id,
-                    practitioner_type_id,
-                    rate
-                ))
+                """, (org_id, client_id, practitioner_type_id, rate))
 
         conn.commit()
         return client_id, client_number
@@ -1189,7 +1279,6 @@ def create_client(
 
     finally:
         conn.close()
-
 
 def list_clients(org_id):
     conn = get_connection()
@@ -1212,10 +1301,154 @@ def get_client(org_id, client_id):
     return row_to_dict(row)
 
 
-def list_client_sla_rates(org_id, client_id):
-    conn = get_connection()
+def update_client(
+    org_id,
+    client_id,
+    name,
+    client_type,
+    email="",
+    phone="",
+    address="",
+    reference="",
+    notes="",
+    billing_type=None
+):
+    """Correct client details without changing the client number or history."""
+    name = str(name or "").strip()
+    if not name:
+        raise ValueError("Client name is required.")
 
+    conn = get_connection()
+    try:
+        existing = conn.execute("""
+            SELECT * FROM clients WHERE id=? AND org_id=?
+        """, (client_id, org_id)).fetchone()
+
+        if not existing:
+            raise ValueError("Client not found.")
+
+        new_billing_type = str(billing_type or existing["billing_type"] or "General").strip()
+        if new_billing_type not in ("General", "SLA"):
+            raise ValueError("Billing type must be General or SLA.")
+
+        conn.execute("""
+            UPDATE clients
+            SET name=?, client_type=?, email=?, phone=?, address=?,
+                reference=?, notes=?, billing_type=?
+            WHERE id=? AND org_id=?
+        """, (
+            name,
+            str(client_type or "").strip(),
+            str(email or "").strip(),
+            str(phone or "").strip(),
+            str(address or "").strip(),
+            str(reference or "").strip(),
+            str(notes or "").strip(),
+            new_billing_type,
+            client_id,
+            org_id,
+        ))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+def save_client_sla_service_rate(
+    org_id,
+    client_id,
+    service_id,
+    practitioner_type_id,
+    rate,
+    unit=None
+):
+    """Add or update one Service + Practitioner Type SLA rate."""
+    conn = get_connection()
+    try:
+        client = conn.execute("""
+            SELECT billing_type FROM clients WHERE id=? AND org_id=?
+        """, (client_id, org_id)).fetchone()
+        if not client:
+            raise ValueError("Client not found.")
+        if client["billing_type"] != "SLA":
+            raise ValueError("SLA rates can only be configured for an SLA client.")
+
+        rows = _validate_sla_service_rows(conn, org_id, [{
+            "service_id": service_id,
+            "practitioner_type_id": practitioner_type_id,
+            "rate": rate,
+            "unit": unit,
+        }])
+        row = rows[0]
+
+        conn.execute("""
+            INSERT INTO client_sla_service_rates(
+                org_id, client_id, service_id, practitioner_type_id,
+                rate, unit, active
+            )
+            VALUES (?, ?, ?, ?, ?, ?, 1)
+            ON CONFLICT(org_id, client_id, service_id, practitioner_type_id)
+            DO UPDATE SET
+                rate=excluded.rate,
+                unit=excluded.unit,
+                active=1,
+                updated_at=CURRENT_TIMESTAMP
+        """, (
+            org_id, client_id, row["service_id"], row["practitioner_type_id"],
+            row["rate"], row["unit"]
+        ))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+def delete_client_sla_service_rate(org_id, client_id, rate_id):
+    """Remove one service-specific SLA rate. Historical completed tasks are untouched."""
+    conn = get_connection()
+    try:
+        cur = conn.execute("""
+            DELETE FROM client_sla_service_rates
+            WHERE id=? AND client_id=? AND org_id=?
+        """, (rate_id, client_id, org_id))
+        if cur.raw.rowcount == 0:
+            raise ValueError("SLA rate not found.")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+def list_client_sla_service_rates(org_id, client_id):
+    conn = get_connection()
     rows = conn.execute("""
+        SELECT
+            csr.*,
+            s.name AS service_name,
+            pt.name AS practitioner_type
+        FROM client_sla_service_rates csr
+        JOIN services s ON s.id=csr.service_id
+        JOIN practitioner_types pt ON pt.id=csr.practitioner_type_id
+        WHERE csr.org_id=? AND csr.client_id=? AND csr.active=1
+        ORDER BY s.name, pt.name
+    """, (org_id, client_id)).fetchall()
+    conn.close()
+    return rows_to_dicts(rows)
+
+def list_client_sla_rates(org_id, client_id):
+    """
+    Combined SLA rate card.
+
+    Service-specific rows are returned first. Legacy practitioner-only rows remain
+    visible as 'All Services (Legacy)' and continue to act as a fallback.
+    """
+    service_rows = list_client_sla_service_rates(org_id, client_id)
+
+    conn = get_connection()
+    legacy_rows = conn.execute("""
         SELECT
             csr.*,
             pt.name AS practitioner_type
@@ -1224,10 +1457,22 @@ def list_client_sla_rates(org_id, client_id):
         WHERE csr.org_id=? AND csr.client_id=?
         ORDER BY pt.name
     """, (org_id, client_id)).fetchall()
-
     conn.close()
-    return rows_to_dicts(rows)
 
+    combined = []
+    for row in service_rows:
+        item = dict(row)
+        item["rate_scope"] = "Service"
+        combined.append(item)
+
+    for row in legacy_rows:
+        item = dict(row)
+        item["service_id"] = None
+        item["service_name"] = "All Services (Legacy)"
+        item["rate_scope"] = "Legacy"
+        combined.append(item)
+
+    return combined
 
 # ============================================================
 # MATTER TYPES / MATTERS
@@ -1297,15 +1542,72 @@ def create_matter(
         """, (matter_type_id, org_id)).fetchone():
             raise ValueError("Matter type does not belong to this firm.")
 
-        year = date.today().year
-        matter_number = _next_number(
-            conn.cursor(),
-            "matters",
-            "matter_number",
-            org_id,
-            f"{org['firm_number']}-MAT-{year}-",
-            4
-        )
+        # Generate a readable matter number from Matter Type + Client + Sequence.
+        # Example: client ...-001 + Divorce / Family Law -> DIV-001-01
+        client = conn.execute(
+            "SELECT client_number FROM clients WHERE id=? AND org_id=?",
+            (client_id, org_id)
+        ).fetchone()
+        matter_type = conn.execute(
+            "SELECT name FROM matter_types WHERE id=? AND org_id=?",
+            (matter_type_id, org_id)
+        ).fetchone()
+
+        if not client or not matter_type:
+            raise ValueError("Client or matter type could not be found.")
+
+        type_codes = {
+            "Litigation": "LIT",
+            "Road Accident Fund (RAF)": "RAF",
+            "Criminal Law": "CRIM",
+            "Divorce / Family Law": "DIV",
+            "Labour Law": "LAB",
+            "Medical Negligence": "MED",
+            "Commercial Law": "COM",
+            "Debt Collection": "DEBT",
+            "Estates / Wills": "EST",
+            "Property / Conveyancing": "CONV",
+            "Corporate / Company Law": "CORP",
+            "Insurance Law": "INS",
+            "Personal Injury": "PI",
+            "Administrative Law": "ADM",
+            "Immigration": "IMM",
+            "Tax": "TAX",
+            "Other": "OTH",
+        }
+
+        type_name = str(matter_type["name"] or "Other").strip()
+        type_code = type_codes.get(type_name)
+        if not type_code:
+            # Firm-created matter types also work automatically.
+            words = re.findall(r"[A-Za-z0-9]+", type_name.upper())
+            if len(words) >= 2:
+                type_code = "".join(word[0] for word in words[:4])
+            elif words:
+                type_code = words[0][:4]
+            else:
+                type_code = "MAT"
+
+        client_number = str(client["client_number"] or "").strip()
+        client_match = re.search(r"(\d+)$", client_number)
+        if not client_match:
+            raise ValueError("Client number does not contain a numeric client identifier.")
+        client_part = client_match.group(1).lstrip("0") or "0"
+        client_part = client_part.zfill(3)
+
+        prefix = f"{type_code}-{client_part}-"
+        existing = conn.execute(
+            "SELECT matter_number FROM matters WHERE org_id=? AND client_id=? AND matter_type_id=? AND matter_number LIKE ?",
+            (org_id, client_id, matter_type_id, prefix + "%")
+        ).fetchall()
+
+        sequences = []
+        for row in existing:
+            match = re.search(r"-(\d+)$", str(row["matter_number"] or ""))
+            if match:
+                sequences.append(int(match.group(1)))
+
+        matter_number = f"{prefix}{max(sequences, default=0) + 1:02d}"
 
         cur = conn.execute("""
             INSERT INTO matters(
@@ -1340,7 +1642,6 @@ def create_matter(
 
     finally:
         conn.close()
-
 
 def list_matters(org_id, client_id=None):
     conn = get_connection()
@@ -1612,25 +1913,47 @@ def complete_task(org_id, task_id, quantity, completion_notes, disbursement_amou
             raise ValueError("This task is already completed.")
 
         if task["billing_type"] == "SLA":
+            # Preferred match: this client + this service + this practitioner type.
             rate_row = conn.execute("""
                 SELECT rate, unit
-                FROM client_sla_rates
+                FROM client_sla_service_rates
                 WHERE org_id=?
                   AND client_id=?
+                  AND service_id=?
                   AND practitioner_type_id=?
+                  AND active=1
             """, (
                 org_id,
                 task["client_id"],
+                task["service_id"],
                 task["practitioner_type_id"]
             )).fetchone()
 
-            if not rate_row:
-                raise ValueError(
-                    "No SLA rate is configured for this client and practitioner type."
-                )
+            if rate_row:
+                rate = float(rate_row["rate"])
+                rate_source = "Client SLA Service Rate"
+            else:
+                # Backward-compatible fallback for existing SLA clients created
+                # before service-specific SLA rates were introduced.
+                rate_row = conn.execute("""
+                    SELECT rate, unit
+                    FROM client_sla_rates
+                    WHERE org_id=?
+                      AND client_id=?
+                      AND practitioner_type_id=?
+                """, (
+                    org_id,
+                    task["client_id"],
+                    task["practitioner_type_id"]
+                )).fetchone()
 
-            rate = float(rate_row["rate"])
-            rate_source = "Client SLA Rate"
+                if not rate_row:
+                    raise ValueError(
+                        "No SLA rate is configured for this Service + Practitioner Type combination."
+                    )
+
+                rate = float(rate_row["rate"])
+                rate_source = "Legacy Client SLA Rate"
 
         else:
             rate_row = conn.execute("""
@@ -1697,7 +2020,6 @@ def complete_task(org_id, task_id, quantity, completion_notes, disbursement_amou
 
     finally:
         conn.close()
-
 
 def list_unbilled_tasks(org_id, client_id=None):
     conn = get_connection()
