@@ -929,7 +929,7 @@ if not st.session_state.authenticated:
                 firm_number = st.text_input("Firm Number", placeholder="NEX-001")
                 cell = st.text_input("Cellphone Number", placeholder="0831234567")
 
-                if st.form_submit_button("Send WhatsApp OTP", use_container_width=True):
+                if st.form_submit_button("Send WhatsApp OTP", width="stretch"):
                     user = db.authenticate_user(firm_number, cell)
 
                     if not user:
@@ -961,7 +961,7 @@ if not st.session_state.authenticated:
                     "Verification Code", max_chars=6, placeholder="123456"
                 )
 
-                if st.form_submit_button("Verify & Login", use_container_width=True):
+                if st.form_submit_button("Verify & Login", width="stretch"):
                     ok, message = verify_login_otp(otp_code)
                     if ok:
                         st.success(message)
@@ -977,7 +977,7 @@ if not st.session_state.authenticated:
                 )
 
                 if elapsed >= 60:
-                    if st.button("Resend OTP", use_container_width=True):
+                    if st.button("Resend OTP", width="stretch"):
                         try:
                             send_login_otp(otp_user)
                             st.success("A new verification code was sent.")
@@ -989,7 +989,7 @@ if not st.session_state.authenticated:
                     st.caption(f"You can request a new code in {remaining} second(s).")
 
             with c2:
-                if st.button("Use Different Login", use_container_width=True):
+                if st.button("Use Different Login", width="stretch"):
                     clear_otp_state()
                     st.rerun()
 
@@ -1009,7 +1009,7 @@ if not st.session_state.authenticated:
 
             if st.form_submit_button(
                 "Register Firm",
-                use_container_width=True
+                width="stretch"
             ):
 
                 success, message, data = db.register_new_firm(
@@ -1064,7 +1064,7 @@ if not st.session_state.authenticated:
 
                     if st.form_submit_button(
                         "Send Super Admin OTP",
-                        use_container_width=True
+                        width="stretch"
                     ):
                         entered_cell = db.normalize_cell(super_cell)
                         expected_cell = db.normalize_cell(configured_cell)
@@ -1090,7 +1090,7 @@ if not st.session_state.authenticated:
 
                     if st.form_submit_button(
                         "Verify & Open Control Centre",
-                        use_container_width=True
+                        width="stretch"
                     ):
                         ok, message = verify_super_admin_otp(super_code)
                         if ok:
@@ -1105,7 +1105,7 @@ if not st.session_state.authenticated:
                         st.session_state.get("super_otp_last_sent_at", 0)
                     )
                     if elapsed >= 60:
-                        if st.button("Resend Super Admin OTP", use_container_width=True):
+                        if st.button("Resend Super Admin OTP", width="stretch"):
                             try:
                                 send_super_admin_otp(super_user)
                                 st.success("A new Super Admin verification code was sent.")
@@ -1117,7 +1117,7 @@ if not st.session_state.authenticated:
                         st.caption(f"You can request a new code in {remaining} second(s).")
 
                 with c2:
-                    if st.button("Cancel Super Admin Login", use_container_width=True):
+                    if st.button("Cancel Super Admin Login", width="stretch"):
                         clear_super_admin_otp_state()
                         st.rerun()
 
@@ -1161,7 +1161,7 @@ if st.session_state.get("is_super_admin"):
 
         st.divider()
 
-        if st.button("🚪 Super Admin Logout", use_container_width=True):
+        if st.button("🚪 Super Admin Logout", width="stretch"):
             clear_session()
 
     st.markdown(
@@ -1207,7 +1207,7 @@ if st.session_state.get("is_super_admin"):
                     }
                     for f in firms[:15]
                 ]),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True
             )
         else:
@@ -1243,7 +1243,7 @@ if st.session_state.get("is_super_admin"):
                                 }
                                 for u in users
                             ]),
-                            use_container_width=True,
+                            width="stretch",
                             hide_index=True
                         )
 
@@ -1253,7 +1253,7 @@ if st.session_state.get("is_super_admin"):
                         if st.button(
                             "✅ Approve Firm",
                             key=f"approve_firm_{firm['id']}",
-                            use_container_width=True
+                            width="stretch"
                         ):
                             try:
                                 approved = db.approve_firm(
@@ -1282,7 +1282,7 @@ if st.session_state.get("is_super_admin"):
                             )
                             if st.form_submit_button(
                                 "❌ Reject Registration",
-                                use_container_width=True
+                                width="stretch"
                             ):
                                 try:
                                     db.reject_firm(
@@ -1337,7 +1337,7 @@ if st.session_state.get("is_super_admin"):
                         }
                         for u in users
                     ]),
-                    use_container_width=True,
+                    width="stretch",
                     hide_index=True
                 )
 
@@ -1346,7 +1346,7 @@ if st.session_state.get("is_super_admin"):
                     reason = st.text_input("Suspension Reason")
                     if st.form_submit_button(
                         "Suspend Firm",
-                        use_container_width=True
+                        width="stretch"
                     ):
                         db.suspend_firm(
                             selected["id"],
@@ -1359,7 +1359,7 @@ if st.session_state.get("is_super_admin"):
             elif selected["status"] == "SUSPENDED":
                 if st.button(
                     "Reactivate Firm",
-                    use_container_width=True
+                    width="stretch"
                 ):
                     db.reactivate_firm(
                         selected["id"],
@@ -1376,7 +1376,7 @@ if st.session_state.get("is_super_admin"):
             elif selected["status"] == "REJECTED":
                 if st.button(
                     "Approve Previously Rejected Firm",
-                    use_container_width=True
+                    width="stretch"
                 ):
                     approved = db.approve_firm(
                         selected["id"],
@@ -1464,7 +1464,7 @@ if st.session_state.get("is_super_admin"):
 
                 if st.form_submit_button(
                     "Save Subscription",
-                    use_container_width=True
+                    width="stretch"
                 ):
                     db.upsert_platform_subscription(
                         selected["id"],
@@ -1494,7 +1494,7 @@ if st.session_state.get("is_super_admin"):
                     }
                     for f in portfolio
                 ]),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True
             )
 
@@ -1562,7 +1562,7 @@ if st.session_state.get("is_super_admin"):
                     }
                     for a in audit
                 ]),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True
             )
 
@@ -1679,7 +1679,7 @@ with st.sidebar:
 
     if st.button(
         "🚪 Logout",
-        use_container_width=True
+        width="stretch"
     ):
         clear_session()
 
@@ -1796,7 +1796,7 @@ elif menu == "Clients":
     st.markdown("""
     <div class="nx-soft">
         Register and manage clients here. General clients use the firm's General Fee Schedule.
-        SLA clients get their own client-specific rate card by practitioner type during registration.
+        SLA clients use a client-specific Service + Practitioner Type rate card.
     </div>
     """, unsafe_allow_html=True)
 
@@ -1804,106 +1804,208 @@ elif menu == "Clients":
         ["➕ Register Client", "Client Directory"]
     )
 
+    practitioner_types = db.list_practitioner_types(org_id)
+    services = db.list_services(org_id)
+
     with tab_register:
 
-        practitioner_types = db.list_practitioner_types(org_id)
+        # SLA rows are built in session state before the client is saved.
+        if "new_client_sla_rows" not in st.session_state:
+            st.session_state.new_client_sla_rows = []
 
-        with st.form("client_registration_form"):
+        c1, c2 = st.columns(2)
 
-            c1, c2 = st.columns(2)
+        with c1:
+            client_name = st.text_input("Client Full Name / Entity Name", key="new_client_name")
+            client_type = st.selectbox(
+                "Client Type",
+                ["Individual", "Company", "Trust", "Estate", "Other"],
+                key="new_client_type"
+            )
+            email = st.text_input("Email Address", key="new_client_email")
+            phone = st.text_input("Cellphone / Telephone", key="new_client_phone")
 
-            with c1:
-                client_name = st.text_input("Client Full Name / Entity Name")
-                client_type = st.selectbox(
-                    "Client Type",
-                    ["Individual", "Company", "Trust", "Estate", "Other"]
+        with c2:
+            address = st.text_area("Physical / Postal Address", key="new_client_address")
+            reference = st.text_input(
+                "Client Reference / ID / Registration Number",
+                key="new_client_reference"
+            )
+            billing_type = st.selectbox(
+                "Billing Type",
+                ["General", "SLA"],
+                key="new_client_billing_type"
+            )
+            notes = st.text_area("Client Notes", key="new_client_notes")
+
+        if billing_type == "SLA":
+            st.markdown("### SLA Fee Agreement")
+            st.caption(
+                "Add only the negotiated SLA fees for this client. "
+                "Choose a Service, Practitioner Type and Rate, then click Add SLA Fee."
+            )
+
+            if not practitioner_types:
+                st.error(
+                    "No Practitioner Types exist yet. "
+                    "Go to Admin & Firm Settings → Practitioner Types first."
                 )
-                email = st.text_input("Email Address")
-                phone = st.text_input("Cellphone / Telephone")
-
-            with c2:
-                address = st.text_area("Physical / Postal Address")
-                reference = st.text_input(
-                    "Client Reference / ID / Registration Number"
+            elif not services:
+                st.error(
+                    "No Task Types / Services exist yet. "
+                    "Go to Admin & Firm Settings → Task Types / Services first."
                 )
-                billing_type = st.selectbox(
-                    "Billing Type",
-                    ["General", "SLA"]
-                )
-                notes = st.text_area("Client Notes")
+            else:
+                service_by_name = {s["name"]: s for s in services}
+                practitioner_by_name = {pt["name"]: pt for pt in practitioner_types}
 
-            sla_rates = {}
-
-            if billing_type == "SLA":
-
-                st.markdown("### SLA Rate Card")
-
-                st.caption(
-                    "These are the negotiated rates for this client. "
-                    "They depend only on practitioner type, not on the task/service."
-                )
-
-                if not practitioner_types:
-                    st.error(
-                        "No Practitioner Types exist yet. "
-                        "Go to Admin & Firm Settings → Practitioner Types first."
-                    )
-                else:
-                    cols = st.columns(2)
-
-                    for idx, pt in enumerate(practitioner_types):
-                        with cols[idx % 2]:
-                            sla_rates[pt["id"]] = st.number_input(
-                                f"{pt['name']} Rate (R per hour)",
-                                min_value=0.0,
-                                value=0.0,
-                                step=100.0,
-                                key=f"sla_rate_{pt['id']}"
-                            )
-
-            if st.form_submit_button(
-                "Register Client",
-                use_container_width=True
-            ):
-
-                if not client_name.strip():
-                    st.error("Client name is required.")
-
-                elif billing_type == "SLA" and not practitioner_types:
-                    st.error(
-                        "Create Practitioner Types before registering an SLA client."
-                    )
-
-                elif (
-                    billing_type == "SLA"
-                    and any(rate <= 0 for rate in sla_rates.values())
-                ):
-                    st.error(
-                        "Enter an SLA rate greater than zero for every practitioner type."
-                    )
-
-                else:
-                    try:
-                        client_id, client_number = db.create_client(
-                            org_id,
-                            client_name.strip(),
-                            client_type,
-                            email.strip(),
-                            phone.strip(),
-                            address.strip(),
-                            reference.strip(),
-                            notes.strip(),
-                            billing_type,
-                            sla_rates if billing_type == "SLA" else None
+                with st.form("new_client_sla_fee_form", clear_on_submit=False):
+                    r1, r2, r3 = st.columns([2, 2, 1])
+                    with r1:
+                        sla_service_name = st.selectbox(
+                            "Service",
+                            list(service_by_name.keys())
+                        )
+                    with r2:
+                        sla_practitioner_name = st.selectbox(
+                            "Practitioner Type",
+                            list(practitioner_by_name.keys())
+                        )
+                    with r3:
+                        sla_rate = st.number_input(
+                            "SLA Rate (R)",
+                            min_value=0.0,
+                            value=0.0,
+                            step=100.0
                         )
 
-                        st.success(
-                            f"Client {client_name.strip()} successfully registered to {firm_name}."
-                        )
-                        st.write(f"**Client Number:** `{client_number}`")
+                    add_sla_fee = st.form_submit_button(
+                        "➕ Add SLA Fee",
+                        width="stretch"
+                    )
 
-                    except Exception as e:
-                        st.error(f"Could not register client: {e}")
+                if add_sla_fee:
+                    if sla_rate <= 0:
+                        st.error("Enter an SLA rate greater than zero.")
+                    else:
+                        selected_service = service_by_name[sla_service_name]
+                        selected_practitioner = practitioner_by_name[sla_practitioner_name]
+                        rows = st.session_state.new_client_sla_rows
+                        existing = next((
+                            row for row in rows
+                            if int(row["service_id"]) == int(selected_service["id"])
+                            and int(row["practitioner_type_id"]) == int(selected_practitioner["id"])
+                        ), None)
+
+                        row_data = {
+                            "service_id": selected_service["id"],
+                            "service_name": selected_service["name"],
+                            "practitioner_type_id": selected_practitioner["id"],
+                            "practitioner_type": selected_practitioner["name"],
+                            "rate": float(sla_rate),
+                            "unit": selected_service.get("default_unit") or "Hour",
+                        }
+
+                        if existing:
+                            existing.update(row_data)
+                            st.success("That SLA fee already existed, so Nexora updated the rate.")
+                        else:
+                            rows.append(row_data)
+                            st.success("SLA fee added.")
+                        st.rerun()
+
+                sla_rows = st.session_state.new_client_sla_rows
+                if sla_rows:
+                    st.markdown("**Fees added to this SLA**")
+                    st.dataframe(
+                        pd.DataFrame([
+                            {
+                                "Service": row["service_name"],
+                                "Practitioner Type": row["practitioner_type"],
+                                "Rate": row["rate"],
+                                "Unit": row["unit"],
+                            }
+                            for row in sla_rows
+                        ]),
+                        width="stretch",
+                        hide_index=True
+                    )
+
+                    remove_options = {
+                        f"{row['service_name']} — {row['practitioner_type']} — {money(row['rate'])}": idx
+                        for idx, row in enumerate(sla_rows)
+                    }
+                    rc1, rc2 = st.columns([3, 1])
+                    with rc1:
+                        remove_sla_label = st.selectbox(
+                            "Remove an SLA fee",
+                            list(remove_options.keys()),
+                            key="new_client_remove_sla_fee"
+                        )
+                    with rc2:
+                        st.write("")
+                        st.write("")
+                        if st.button("Remove", key="new_client_remove_sla_btn", width="stretch"):
+                            sla_rows.pop(remove_options[remove_sla_label])
+                            st.rerun()
+                else:
+                    st.info("No SLA fees added yet.")
+
+        st.divider()
+        if st.button("Register Client", key="register_client_btn", width="stretch"):
+            sla_rows = st.session_state.get("new_client_sla_rows", [])
+
+            if not client_name.strip():
+                st.error("Client name is required.")
+            elif billing_type == "SLA" and not practitioner_types:
+                st.error("Create Practitioner Types before registering an SLA client.")
+            elif billing_type == "SLA" and not services:
+                st.error("Create Task Types / Services before registering an SLA client.")
+            elif billing_type == "SLA" and not sla_rows:
+                st.error("Add at least one SLA fee before registering this SLA client.")
+            else:
+                try:
+                    sla_service_rates = [
+                        {
+                            "service_id": row["service_id"],
+                            "practitioner_type_id": row["practitioner_type_id"],
+                            "rate": row["rate"],
+                            "unit": row["unit"],
+                        }
+                        for row in sla_rows
+                    ] if billing_type == "SLA" else None
+
+                    client_id, client_number = db.create_client(
+                        org_id,
+                        client_name.strip(),
+                        client_type,
+                        email.strip(),
+                        phone.strip(),
+                        address.strip(),
+                        reference.strip(),
+                        notes.strip(),
+                        billing_type,
+                        None,
+                        sla_service_rates
+                    )
+
+                    st.session_state.new_client_sla_rows = []
+                    for key in [
+                        "new_client_name", "new_client_type", "new_client_email",
+                        "new_client_phone", "new_client_address", "new_client_reference",
+                        "new_client_billing_type", "new_client_notes",
+                        "new_client_remove_sla_fee"
+                    ]:
+                        st.session_state.pop(key, None)
+
+                    st.success(
+                        f"Client {client_name.strip()} successfully registered to {firm_name}. "
+                        f"Client Number: {client_number}"
+                    )
+                    st.rerun()
+
+                except Exception as e:
+                    st.error(f"Could not register client: {e}")
 
     with tab_directory:
 
@@ -1912,6 +2014,9 @@ elif menu == "Clients":
         if not clients:
             st.info("No clients registered yet.")
         else:
+            service_map = {s["name"]: s for s in services}
+            practitioner_map = {pt["name"]: pt for pt in practitioner_types}
+
             for client in clients:
                 with st.container(border=True):
                     st.subheader(client["name"])
@@ -1920,27 +2025,217 @@ elif menu == "Clients":
                     st.write(f"**Email:** {client.get('email') or '-'}")
                     st.write(f"**Phone:** {client.get('phone') or '-'}")
                     st.write(f"**Address:** {client.get('address') or '-'}")
+                    st.write(f"**Reference:** {client.get('reference') or '-'}")
 
+                    # ----------------------------------------------------
+                    # Edit client details
+                    # ----------------------------------------------------
+                    with st.expander("✏️ Edit Client Details"):
+                        with st.form(f"edit_client_{client['id']}"):
+                            ec1, ec2 = st.columns(2)
+
+                            with ec1:
+                                edit_name = st.text_input(
+                                    "Client Full Name / Entity Name",
+                                    value=client.get("name") or "",
+                                    key=f"edit_name_{client['id']}"
+                                )
+                                client_types = ["Individual", "Company", "Trust", "Estate", "Other"]
+                                current_client_type = client.get("client_type") or "Individual"
+                                edit_client_type = st.selectbox(
+                                    "Client Type",
+                                    client_types,
+                                    index=client_types.index(current_client_type) if current_client_type in client_types else 0,
+                                    key=f"edit_type_{client['id']}"
+                                )
+                                edit_email = st.text_input(
+                                    "Email Address",
+                                    value=client.get("email") or "",
+                                    key=f"edit_email_{client['id']}"
+                                )
+                                edit_phone = st.text_input(
+                                    "Cellphone / Telephone",
+                                    value=client.get("phone") or "",
+                                    key=f"edit_phone_{client['id']}"
+                                )
+
+                            with ec2:
+                                edit_address = st.text_area(
+                                    "Physical / Postal Address",
+                                    value=client.get("address") or "",
+                                    key=f"edit_address_{client['id']}"
+                                )
+                                edit_reference = st.text_input(
+                                    "Client Reference / ID / Registration Number",
+                                    value=client.get("reference") or "",
+                                    key=f"edit_reference_{client['id']}"
+                                )
+                                billing_options = ["General", "SLA"]
+                                current_billing = client.get("billing_type") or "General"
+                                edit_billing_type = st.selectbox(
+                                    "Billing Type",
+                                    billing_options,
+                                    index=billing_options.index(current_billing) if current_billing in billing_options else 0,
+                                    key=f"edit_billing_{client['id']}"
+                                )
+                                edit_notes = st.text_area(
+                                    "Client Notes",
+                                    value=client.get("notes") or "",
+                                    key=f"edit_notes_{client['id']}"
+                                )
+
+                            billing_changed = edit_billing_type != current_billing
+                            confirm_billing_change = True
+                            if billing_changed:
+                                st.warning(
+                                    "Changing billing type affects how future tasks are priced. "
+                                    "Existing completed tasks and invoices will not be recalculated."
+                                )
+                                confirm_billing_change = st.checkbox(
+                                    "I confirm this billing type change",
+                                    key=f"confirm_billing_{client['id']}"
+                                )
+
+                            if st.form_submit_button("Save Client Changes", width="stretch"):
+                                if not edit_name.strip():
+                                    st.error("Client name is required.")
+                                elif billing_changed and not confirm_billing_change:
+                                    st.error("Confirm the billing type change first.")
+                                else:
+                                    try:
+                                        db.update_client(
+                                            org_id,
+                                            client["id"],
+                                            edit_name.strip(),
+                                            edit_client_type,
+                                            edit_email.strip(),
+                                            edit_phone.strip(),
+                                            edit_address.strip(),
+                                            edit_reference.strip(),
+                                            edit_notes.strip(),
+                                            edit_billing_type
+                                        )
+                                        st.success("Client details updated.")
+                                        st.rerun()
+                                    except Exception as e:
+                                        st.error(str(e))
+
+                    # ----------------------------------------------------
+                    # SLA rate card management
+                    # ----------------------------------------------------
                     if client["billing_type"] == "SLA":
-                        rates = db.list_client_sla_rates(
-                            org_id,
-                            client["id"]
-                        )
+                        rates = db.list_client_sla_rates(org_id, client["id"])
 
+                        st.markdown("**SLA Rate Card**")
                         if rates:
-                            st.markdown("**SLA Rate Card**")
                             st.dataframe(
                                 pd.DataFrame([
                                     {
+                                        "Service": r.get("service_name") or "All Services (Legacy)",
                                         "Practitioner Type": r["practitioner_type"],
                                         "Rate": r["rate"],
-                                        "Unit": r["unit"]
+                                        "Unit": r["unit"],
+                                        "Type": r.get("rate_scope") or "Service",
                                     }
                                     for r in rates
                                 ]),
-                                use_container_width=True,
+                                width="stretch",
                                 hide_index=True
                             )
+                        else:
+                            st.warning("No SLA rates are configured for this client yet.")
+
+                        with st.expander("💼 Add / Correct SLA Rate"):
+                            if not services or not practitioner_types:
+                                st.error(
+                                    "The firm needs at least one active Service and Practitioner Type."
+                                )
+                            else:
+                                with st.form(f"sla_rate_editor_{client['id']}"):
+                                    selected_service_name = st.selectbox(
+                                        "Service",
+                                        list(service_map.keys()),
+                                        key=f"sla_service_{client['id']}"
+                                    )
+                                    selected_practitioner_name = st.selectbox(
+                                        "Practitioner Type",
+                                        list(practitioner_map.keys()),
+                                        key=f"sla_practitioner_{client['id']}"
+                                    )
+                                    selected_service = service_map[selected_service_name]
+                                    selected_practitioner = practitioner_map[selected_practitioner_name]
+
+                                    existing_match = next(
+                                        (
+                                            r for r in rates
+                                            if r.get("rate_scope") == "Service"
+                                            and int(r.get("service_id")) == int(selected_service["id"])
+                                            and int(r.get("practitioner_type_id")) == int(selected_practitioner["id"])
+                                        ),
+                                        None
+                                    )
+
+                                    sla_rate_value = st.number_input(
+                                        "SLA Rate (R)",
+                                        min_value=0.0,
+                                        value=float(existing_match["rate"]) if existing_match else 0.0,
+                                        step=100.0,
+                                        key=f"sla_rate_value_{client['id']}"
+                                    )
+
+                                    st.caption(
+                                        "Saving an existing Service + Practitioner Type combination updates that rate; "
+                                        "it does not create a duplicate."
+                                    )
+
+                                    if st.form_submit_button("Save SLA Rate", width="stretch"):
+                                        if sla_rate_value <= 0:
+                                            st.error("Enter an SLA rate greater than zero.")
+                                        else:
+                                            try:
+                                                db.save_client_sla_service_rate(
+                                                    org_id,
+                                                    client["id"],
+                                                    selected_service["id"],
+                                                    selected_practitioner["id"],
+                                                    sla_rate_value,
+                                                    selected_service.get("default_unit") or "Hour"
+                                                )
+                                                st.success("SLA rate saved.")
+                                                st.rerun()
+                                            except Exception as e:
+                                                st.error(str(e))
+
+                        service_specific_rates = [
+                            r for r in rates if r.get("rate_scope") == "Service"
+                        ]
+                        if service_specific_rates:
+                            with st.expander("🗑️ Remove an SLA Rate"):
+                                removable_map = {
+                                    f"{r['service_name']} — {r['practitioner_type']} — {money(r['rate'])}": r
+                                    for r in service_specific_rates
+                                }
+                                remove_label = st.selectbox(
+                                    "SLA Rate",
+                                    list(removable_map.keys()),
+                                    key=f"remove_sla_{client['id']}"
+                                )
+                                if st.button(
+                                    "Remove Selected SLA Rate",
+                                    key=f"remove_sla_btn_{client['id']}",
+                                    width="stretch"
+                                ):
+                                    try:
+                                        selected_rate = removable_map[remove_label]
+                                        db.delete_client_sla_service_rate(
+                                            org_id,
+                                            client["id"],
+                                            selected_rate["id"]
+                                        )
+                                        st.success("SLA rate removed. Historical completed billing is unchanged.")
+                                        st.rerun()
+                                    except Exception as e:
+                                        st.error(str(e))
 
                     with st.expander("Upload Client Document"):
 
@@ -1973,7 +2268,6 @@ elif menu == "Clients":
 
                                     st.success("Document uploaded.")
                                     st.rerun()
-
 
 # ============================================================
 # MATTERS & TASKS
@@ -2032,7 +2326,7 @@ elif menu == "Matters & Tasks":
 
                 if st.form_submit_button(
                     "Open Matter",
-                    use_container_width=True
+                    width="stretch"
                 ):
                     if not title.strip():
                         st.error("Matter title is required.")
@@ -2075,7 +2369,7 @@ elif menu == "Matters & Tasks":
 
             st.dataframe(
                 pd.DataFrame(rows),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True
             )
 
@@ -2110,7 +2404,7 @@ elif menu == "Matters & Tasks":
                     if st.button(
                         "🔒 Close Matter",
                         key=f"work_close_matter_{selected_matter['id']}",
-                        use_container_width=True
+                        width="stretch"
                     ):
                         try:
                             db.close_matter(
@@ -2127,7 +2421,7 @@ elif menu == "Matters & Tasks":
                     if st.button(
                         "🔓 Reopen Matter",
                         key=f"work_reopen_matter_{selected_matter['id']}",
-                        use_container_width=True
+                        width="stretch"
                     ):
                         try:
                             db.reopen_matter(
@@ -2355,7 +2649,7 @@ elif menu == "Documents":
                     }
                     for d in docs
                 ]),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True
             )
         else:
@@ -2463,7 +2757,7 @@ elif menu == "Communications":
         if not call_logs.empty:
             st.dataframe(
                 call_logs,
-                use_container_width=True,
+                width="stretch",
                 hide_index=True
             )
 
@@ -2520,7 +2814,7 @@ elif menu == "Communications":
         if not email_logs.empty:
             st.dataframe(
                 email_logs,
-                use_container_width=True,
+                width="stretch",
                 hide_index=True
             )
 
@@ -2537,7 +2831,7 @@ elif menu == "Billing & Invoices":
     <div class="nx-soft">
         Completed tasks remain Unbilled until selected for an invoice.
         General clients use Service × Practitioner Type fees.
-        SLA clients use that client's practitioner-type SLA rate.
+        SLA clients use that client's Service × Practitioner Type SLA rate.
     </div>
     """, unsafe_allow_html=True)
 
@@ -2640,7 +2934,7 @@ elif menu == "Billing & Invoices":
 
                     if st.form_submit_button(
                         "Create Invoice",
-                        use_container_width=True
+                        width="stretch"
                     ):
 
                         if not selected_task_ids:
@@ -2748,7 +3042,7 @@ elif menu == "Billing & Invoices":
                                 }
                                 for x in items
                             ]),
-                            use_container_width=True,
+                            width="stretch",
                             hide_index=True
                         )
 
@@ -2764,7 +3058,7 @@ elif menu == "Billing & Invoices":
                                 file_name=f"{invoice['invoice_number']}.pdf",
                                 mime="application/pdf",
                                 key=f"download_invoice_{invoice['id']}",
-                                use_container_width=True
+                                width="stretch"
                             )
 
                         except Exception as pdf_error:
@@ -2945,7 +3239,7 @@ elif menu == "Actuarial & Damages":
 
             if st.form_submit_button(
                 "Compute Quantum",
-                use_container_width=True
+                width="stretch"
             ):
 
                 past_loss = max(
@@ -3139,7 +3433,7 @@ elif menu == "Admin & Firm Settings":
                     }
                     for t in types
                 ]),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True
             )
 
@@ -3219,7 +3513,7 @@ elif menu == "Admin & Firm Settings":
                     }
                     for u in users
                 ]),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True
             )
 
@@ -3266,7 +3560,7 @@ elif menu == "Admin & Firm Settings":
                 }
                 for m in matter_types
             ]),
-            use_container_width=True,
+            width="stretch",
             hide_index=True
         )
 
@@ -3340,7 +3634,7 @@ elif menu == "Admin & Firm Settings":
                     }
                     for s in services
                 ]),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True
             )
 
@@ -3445,7 +3739,7 @@ elif menu == "Admin & Firm Settings":
                     }
                     for f in schedule
                 ]),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True
             )
 
