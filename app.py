@@ -1,6 +1,8 @@
 from datetime import date, datetime, timedelta
 from io import BytesIO
+from pathlib import Path
 import os
+import mimetypes
 import uuid
 import hashlib
 import json
@@ -247,8 +249,90 @@ def save_upload(uploaded, prefix):
     return path
 
 
+def document_download_name(document):
+    """Return a user-friendly filename while preserving the original extension."""
+    stored_path = str(document.get("file_path") or "").strip()
+    stored_name = os.path.basename(stored_path)
+    extension = os.path.splitext(stored_name)[1]
+
+    friendly = re.sub(
+        r"[^A-Za-z0-9._-]+",
+        "_",
+        str(document.get("document_name") or "Document").strip()
+    ).strip("_.") or "Document"
+
+    if extension and not friendly.lower().endswith(extension.lower()):
+        friendly += extension
+
+    return friendly
+
+
+def document_mime_type(file_path):
+    guessed, _ = mimetypes.guess_type(str(file_path or ""))
+    return guessed or "application/octet-stream"
+
+
+def load_document_bytes(document):
+    """Load a stored document for download without changing the database record."""
+    file_path = str(document.get("file_path") or "").strip()
+    if not file_path:
+        return None, "No stored file path is recorded for this document."
+
+    # Existing records may contain relative paths such as uploads/....
+    # Resolve those against the application folder used by this local build.
+    candidate = Path(file_path)
+    if not candidate.is_absolute():
+        candidate = Path(__file__).resolve().parent / candidate
+
+    if not candidate.exists() or not candidate.is_file():
+        return None, f"Stored file could not be found: {os.path.basename(file_path)}"
+
+    try:
+        return candidate.read_bytes(), None
+    except Exception as exc:
+        return None, f"Stored file could not be read: {exc}"
+
+
+def render_document_download(document, key_prefix):
+    """Render one safe download button for a document already authorised by org/client/matter query."""
+    data, error = load_document_bytes(document)
+    if error:
+        st.warning(error)
+        return
+
+    st.download_button(
+        label="⬇ Download",
+        data=data,
+        file_name=document_download_name(document),
+        mime=document_mime_type(document.get("file_path")),
+        key=f"{key_prefix}_{document['id']}",
+        width="stretch",
+    )
+
+
 def admin_access():
     return st.session_state.role == "Admin"
+
+
+def local_development_mode():
+    """True only for the SQLite local-development build.
+
+    The production PostgreSQL database module exposes DATABASE_URL instead of
+    DB_PATH, so this bypass does not activate in the production build.
+    """
+    return hasattr(db, "DB_PATH") and not bool(os.getenv("DATABASE_URL", "").strip())
+
+
+def real_otp_enabled():
+    """Allow real WhatsApp OTP testing while still using the local SQLite build."""
+    return os.getenv("NEXORA_REAL_OTP", "false").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+
+
+def local_otp_mode():
+    """Use on-screen development OTP only when SQLite is local and real OTP is off."""
+    return local_development_mode() and not real_otp_enabled()
 
 
 def send_whatsapp_message(cell, body=None, otp_code=None):
@@ -338,20 +422,25 @@ def clear_super_admin_otp_state():
         "super_otp_expires_at",
         "super_otp_attempts",
         "super_otp_last_sent_at",
+        "super_dev_otp",
     ]:
         st.session_state.pop(key, None)
 
 def send_super_admin_otp(user):
     code = f"{secrets.randbelow(1_000_000):06d}"
 
-    send_whatsapp_message(
-        user["cell"],
-        (
-            f"Nexora Super Admin verification code: {code}. "
-            "This code expires in 5 minutes. "
-            "Do not share this code with anyone."
-        ),
-    )
+    if local_otp_mode():
+        # Local SQLite testing only: do not require Twilio credentials.
+        st.session_state.super_dev_otp = code
+    else:
+        send_whatsapp_message(
+            user["cell"],
+            (
+                f"Nexora Super Admin verification code: {code}. "
+                "This code expires in 5 minutes. "
+                "Do not share this code with anyone."
+            ),
+        )
 
     st.session_state.super_otp_user = dict(user)
     st.session_state.super_otp_hash = _otp_digest(
@@ -423,7 +512,7 @@ def _otp_digest(code, firm_number, cell):
 
 def clear_otp_state():
     for key in ["otp_pending_user", "otp_hash", "otp_expires_at",
-                "otp_attempts", "otp_last_sent_at"]:
+                "otp_attempts", "otp_last_sent_at", "dev_login_otp"]:
         st.session_state.pop(key, None)
 
 
@@ -432,15 +521,21 @@ def send_login_otp(user):
     firm_number = str(user["firm_number"])
     cell = str(user["cell"])
 
-    # Use the approved WhatsApp Authentication template, exactly like Super Admin OTP.
-    message = send_whatsapp_message(cell, otp_code=code)
+    if local_otp_mode():
+        # Local SQLite testing only: show the OTP in the app instead of WhatsApp.
+        st.session_state.dev_login_otp = code
+        message_sid = "LOCAL-DEV-OTP"
+    else:
+        # Production keeps the approved WhatsApp Authentication template.
+        message = send_whatsapp_message(cell, otp_code=code)
+        message_sid = message.sid
 
     st.session_state.otp_pending_user = dict(user)
     st.session_state.otp_hash = _otp_digest(code, firm_number, cell)
     st.session_state.otp_expires_at = time.time() + 300
     st.session_state.otp_attempts = 0
     st.session_state.otp_last_sent_at = time.time()
-    return message.sid
+    return message_sid
 
 def verify_login_otp(code):
     user = st.session_state.get("otp_pending_user")
@@ -479,6 +574,278 @@ def verify_login_otp(code):
     clear_otp_state()
     login_user(verified_user)
     return True, "Verification successful."
+
+
+def _nexora_openai_text(api_key, system_prompt, user_prompt):
+    """Single controlled gateway for Nexora Intelligence responses."""
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is not configured.")
+    if not OpenAI:
+        raise RuntimeError("The OpenAI Python package is not installed.")
+
+    client = OpenAI(api_key=api_key)
+    model = os.getenv("OPENAI_MODEL", "gpt-5.6-luna").strip() or "gpt-5.6-luna"
+    response = client.responses.create(
+        model=model,
+        input=f"{system_prompt}\n\n{user_prompt}"
+    )
+    return response.output_text
+
+
+def _matter_context_text(client_record, matter, tasks=None, documents=None):
+    tasks = tasks or []
+    documents = documents or []
+    task_lines = [
+        f"- {t.get('task_number')}: {t.get('service_name')} | {t.get('title')} | "
+        f"status={t.get('status')} | due={t.get('due_date')}"
+        for t in tasks
+    ] or ["- None recorded"]
+    document_lines = [
+        f"- {d.get('document_name') or 'Document'}"
+        for d in documents
+    ] or ["- None recorded"]
+
+    return f"""
+CLIENT
+Client Number: {client_record.get('client_number')}
+Name: {client_record.get('name')}
+Client Type: {client_record.get('client_type') or ''}
+Reference: {client_record.get('reference') or ''}
+Address: {client_record.get('address') or ''}
+Email: {client_record.get('email') or ''}
+Phone: {client_record.get('phone') or ''}
+Notes: {client_record.get('notes') or ''}
+
+MATTER
+Matter Number: {matter.get('matter_number')}
+Matter Type: {matter.get('matter_type') or ''}
+Title: {matter.get('title') or ''}
+Status: {matter.get('status') or ''}
+Priority: {matter.get('priority') or ''}
+Particulars: {matter.get('particulars') or ''}
+
+TASKS
+{chr(10).join(task_lines)}
+
+DOCUMENTS ON FILE (names only unless text is separately supplied)
+{chr(10).join(document_lines)}
+""".strip()
+
+
+def _draft_requirements_for_document(document_type, matter_type, client_record, matter):
+    """Return document-aware drafting fields, prefilling facts already held by Nexora."""
+    doc = str(document_type or "").lower()
+    mtype = str(matter_type or "").lower()
+    client_name = str(client_record.get("name") or "")
+    client_address = str(client_record.get("address") or "")
+    particulars = str(matter.get("particulars") or "")
+
+    def field(key, label, help_text="", value="", required=True):
+        return {
+            "key": key,
+            "label": label,
+            "help": help_text,
+            "value": value or "",
+            "required": required,
+        }
+
+    # Summons / Divorce Summons
+    if "summons" in doc:
+        fields = [
+            field("court", "Court / jurisdiction", "Example: High Court of South Africa, Gauteng Division, Pretoria."),
+            field("plaintiff", "Plaintiff / applicant details", "Confirm the party instituting proceedings.", client_name),
+            field("plaintiff_address", "Plaintiff address", "Use the address already recorded or correct it here.", client_address, False),
+            field("defendant", "Defendant / opposing party details", "Full legal name and capacity of the defendant/respondent."),
+            field("service_address", "Defendant address for service", "Physical/domicilium address where process may be served."),
+            field("claim_amount", "Claim amount / relief sought", "State the amount claimed or describe the relief sought.", required=False),
+            field("cause", "Cause of action / material facts", "Key facts supporting the claim. Matter particulars are prefilled where available.", particulars),
+            field("dates", "Relevant dates", "Accident, breach, demand, cause-of-action or other legally relevant dates.", required=False),
+        ]
+        if "road accident fund" in mtype or "raf" in mtype:
+            fields.extend([
+                field("raf_claim_number", "RAF claim number", "RAF claim/reference number, if available.", required=False),
+                field("accident_details", "Accident details", "Date, place and concise circumstances of the motor vehicle accident.", particulars, False),
+                field("injuries_damages", "Injuries and heads of damages", "Briefly identify injuries and heads of damages to be pleaded.", required=False),
+            ])
+        if "divorce" in doc or "divorce" in mtype or "family" in mtype:
+            fields.extend([
+                field("marriage_details", "Marriage details", "Date/place of marriage and marital property regime."),
+                field("children", "Minor children / parenting details", "Names/ages and relief concerning children, where applicable.", required=False),
+                field("divorce_relief", "Divorce relief sought", "For example decree of divorce, division of estate, maintenance or costs.", required=False),
+            ])
+        return fields
+
+    # Lease Agreement
+    if "lease" in doc:
+        return [
+            field("lessor", "Lessor details", "Full legal name and capacity of the lessor.", client_name),
+            field("lessee", "Lessee details", "Full legal name and capacity of the lessee."),
+            field("property", "Property / premises address", "Full description and address of the leased premises."),
+            field("rent", "Monthly rental", "Rental amount and whether VAT is included, if applicable."),
+            field("deposit", "Deposit", "Deposit amount and conditions for holding/refund.", required=False),
+            field("start_date", "Commencement date", "Date on which the lease starts."),
+            field("term", "Lease term", "Fixed period, month-to-month, or other duration."),
+            field("escalation", "Rental escalation", "Annual escalation percentage/date, if applicable.", required=False),
+            field("utilities", "Utilities and operating costs", "Who pays electricity, water, rates, levies or other charges.", required=False),
+            field("use", "Permitted use", "Residential, commercial or other permitted use of the premises.", required=False),
+            field("termination", "Termination / cancellation terms", "Notice period and any agreed cancellation provisions.", required=False),
+            field("special", "Special conditions", "Any negotiated clauses or special instructions.", required=False),
+        ]
+
+    if "non-disclosure" in doc or "nda" in doc:
+        return [
+            field("disclosing_party", "Disclosing party", value=client_name),
+            field("receiving_party", "Receiving party"),
+            field("purpose", "Purpose of disclosure", "Why confidential information will be shared."),
+            field("confidential_info", "Confidential information covered", "Describe the information/categories to protect."),
+            field("duration", "Confidentiality period", "How long the obligations must continue."),
+            field("jurisdiction", "Governing law / jurisdiction", required=False),
+            field("special", "Special conditions", required=False),
+        ]
+
+    if "service agreement" in doc or "service level agreement" in doc or "sla" in doc:
+        return [
+            field("provider", "Service provider", value=client_name),
+            field("customer", "Customer / other contracting party"),
+            field("services", "Services / scope of work", "Describe exactly what will be provided.", particulars),
+            field("fees", "Fees / payment terms"),
+            field("start_date", "Effective / commencement date"),
+            field("duration", "Duration / term", required=False),
+            field("service_levels", "Service levels / deliverables", required=False),
+            field("termination", "Termination provisions", required=False),
+            field("liability", "Liability / indemnity instructions", required=False),
+            field("jurisdiction", "Governing law / jurisdiction", required=False),
+            field("special", "Special conditions", required=False),
+        ]
+
+    if "acknowledgement of debt" in doc:
+        return [
+            field("creditor", "Creditor", value=client_name),
+            field("debtor", "Debtor"),
+            field("amount", "Debt amount"),
+            field("origin", "Origin / basis of debt", value=particulars),
+            field("payment", "Repayment terms"),
+            field("interest", "Interest", required=False),
+            field("default", "Default consequences", required=False),
+            field("domicilium", "Domicilium / service addresses", required=False),
+        ]
+
+    if "letter of demand" in doc:
+        return [
+            field("recipient", "Recipient / debtor / opposing party"),
+            field("recipient_address", "Recipient address", required=False),
+            field("basis", "Basis of demand", value=particulars),
+            field("amount", "Amount demanded", required=False),
+            field("deadline", "Deadline for compliance / payment"),
+            field("consequence", "Action if demand is not met", required=False),
+        ]
+
+    if "settlement agreement" in doc or "settlement proposal" in doc:
+        return [
+            field("party_a", "First party", value=client_name),
+            field("party_b", "Other party"),
+            field("dispute", "Dispute / matter being settled", value=particulars),
+            field("settlement", "Settlement terms / amount"),
+            field("payment", "Payment / performance terms", required=False),
+            field("release", "Release / waiver terms", required=False),
+            field("costs", "Costs arrangement", required=False),
+            field("confidentiality", "Confidentiality", required=False),
+        ]
+
+    if "affidavit" in doc:
+        return [
+            field("deponent", "Deponent", value=client_name),
+            field("capacity", "Deponent capacity / authority", required=False),
+            field("court", "Court / forum", required=False),
+            field("facts", "Facts to be sworn to", value=particulars),
+            field("relief", "Purpose / relief sought", required=False),
+        ]
+
+    if "particulars of claim" in doc:
+        return [
+            field("court", "Court / jurisdiction"),
+            field("plaintiff", "Plaintiff", value=client_name),
+            field("defendant", "Defendant / opposing party"),
+            field("jurisdiction_facts", "Jurisdictional facts", required=False),
+            field("cause", "Cause of action / material facts", value=particulars),
+            field("amount", "Quantum / relief claimed", required=False),
+            field("dates", "Relevant dates", required=False),
+        ]
+
+    # Generic fallback remains document-aware enough to avoid irrelevant contract prompts.
+    return [
+        field("parties", "Relevant parties", value=client_name),
+        field("purpose", "Purpose / relief / outcome required", value=particulars),
+        field("dates", "Relevant dates", required=False),
+        field("amounts", "Relevant amounts", required=False),
+        field("jurisdiction", "Court / jurisdiction / governing law", required=False),
+        field("special", "Special instructions", required=False),
+    ]
+
+
+def _draft_answers_text(fields, answers):
+    lines = []
+    for item in fields:
+        value = str(answers.get(item["key"], "") or "").strip()
+        if value:
+            lines.append(f"{item['label']}: {value}")
+        elif item.get("required"):
+            lines.append(f"{item['label']}: [MISSING]")
+    return "\n".join(lines) or "[No additional drafting facts supplied]"
+
+
+def _document_types_for_matter(matter_type):
+    matter_type = str(matter_type or "")
+    if "Road Accident Fund" in matter_type or "RAF" in matter_type:
+        return [
+            "Summons",
+            "Particulars of Claim",
+            "Letter of Demand",
+            "Affidavit",
+            "Formal Correspondence",
+            "Settlement Proposal",
+            "Other Legal Document",
+        ]
+    if "Divorce" in matter_type or "Family" in matter_type:
+        return [
+            "Divorce Summons",
+            "Particulars of Claim",
+            "Settlement Agreement",
+            "Parenting Plan",
+            "Affidavit",
+            "Formal Correspondence",
+            "Other Legal Document",
+        ]
+    if any(x in matter_type for x in ["Commercial", "Corporate", "Company"]):
+        return [
+            "Service Agreement",
+            "Non-Disclosure Agreement (NDA)",
+            "Service Level Agreement (SLA)",
+            "Settlement Agreement",
+            "Acknowledgement of Debt",
+            "Lease Agreement",
+            "Employment Agreement",
+            "Formal Correspondence",
+            "Other Contract / Legal Document",
+        ]
+    if "Litigation" in matter_type:
+        return [
+            "Summons",
+            "Particulars of Claim",
+            "Notice of Motion",
+            "Affidavit",
+            "Letter of Demand",
+            "Formal Correspondence",
+            "Other Pleading / Legal Document",
+        ]
+    return [
+        "Letter of Demand",
+        "Affidavit",
+        "Formal Correspondence",
+        "Agreement / Contract",
+        "Legal Memorandum",
+        "Other Legal Document",
+    ]
 
 
 def generate_invoice_pdf(org_id, invoice_id):
@@ -953,7 +1320,11 @@ if not st.session_state.authenticated:
                             st.error(f"Could not send WhatsApp verification code: {e}")
 
         else:
-            st.success("A 6-digit verification code was sent to your registered WhatsApp number.")
+            if local_otp_mode():
+                st.success("Local development verification code generated.")
+                st.warning(f"🧪 Local Development OTP: {st.session_state.get('dev_login_otp', '')}")
+            else:
+                st.success("A 6-digit verification code was sent to your registered WhatsApp number.")
             st.caption(f"Firm: {otp_user['firm_number']} • User: {otp_user['name']}")
 
             with st.form("otp_verify_form"):
@@ -1079,7 +1450,11 @@ if not st.session_state.authenticated:
                             except Exception as e:
                                 st.error(f"Could not send Super Admin verification code: {e}")
             else:
-                st.success("A 6-digit Super Admin verification code was sent to your WhatsApp.")
+                if local_otp_mode():
+                    st.success("Local Super Admin verification code generated.")
+                    st.warning(f"🧪 Local Development OTP: {st.session_state.get('super_dev_otp', '')}")
+                else:
+                    st.success("A 6-digit Super Admin verification code was sent to your WhatsApp.")
 
                 with st.form("super_admin_otp_form"):
                     super_code = st.text_input(
@@ -1654,7 +2029,7 @@ with st.sidebar:
         "Communications",
         "Billing & Invoices",
         "Actuarial & Damages",
-        "AI Assistant",
+        "Nexora Intelligence",
     ]
 
     if admin_access():
@@ -2237,7 +2612,31 @@ elif menu == "Clients":
                                     except Exception as e:
                                         st.error(str(e))
 
-                    with st.expander("Upload Client Document"):
+                    with st.expander("Client Documents"):
+
+                        client_docs = db.get_documents_for_client(
+                            org_id,
+                            client["id"]
+                        )
+
+                        if client_docs:
+                            st.caption("Documents already saved for this client")
+                            for doc in client_docs:
+                                cols = st.columns([3, 2, 1.2])
+                                cols[0].write(f"**{doc['document_name']}**")
+                                cols[1].caption(
+                                    f"{os.path.basename(doc['file_path'])} · {doc['created_at']}"
+                                )
+                                with cols[2]:
+                                    render_document_download(
+                                        doc,
+                                        f"client_doc_download_{client['id']}"
+                                    )
+                        else:
+                            st.caption("No client-level documents saved yet.")
+
+                        st.divider()
+                        st.markdown("**Upload a new client document**")
 
                         with st.form(f"client_doc_{client['id']}"):
 
@@ -2266,7 +2665,7 @@ elif menu == "Clients":
                                         client_id=client["id"]
                                     )
 
-                                    st.success("Document uploaded.")
+                                    st.success("Document uploaded and is now available for download.")
                                     st.rerun()
 
 # ============================================================
@@ -2640,18 +3039,18 @@ elif menu == "Documents":
         )
 
         if docs:
-            st.dataframe(
-                pd.DataFrame([
-                    {
-                        "Document": d["document_name"],
-                        "File": os.path.basename(d["file_path"]),
-                        "Created": d["created_at"]
-                    }
-                    for d in docs
-                ]),
-                width="stretch",
-                hide_index=True
-            )
+            st.markdown("### Saved Documents")
+            for doc in docs:
+                with st.container(border=True):
+                    cols = st.columns([3, 2, 1.2])
+                    cols[0].write(f"**{doc['document_name']}**")
+                    cols[0].caption(f"Created: {doc['created_at']}")
+                    cols[1].caption(os.path.basename(doc["file_path"]))
+                    with cols[2]:
+                        render_document_download(
+                            doc,
+                            f"matter_doc_download_{matter['id']}"
+                        )
         else:
             st.info("No documents uploaded for this matter.")
 
@@ -2683,7 +3082,7 @@ elif menu == "Documents":
                         client_id=matter["client_id"]
                     )
 
-                    st.success("Document uploaded.")
+                    st.success("Document uploaded and is now available for download.")
                     st.rerun()
 
 
@@ -3276,80 +3675,261 @@ elif menu == "Actuarial & Damages":
 
 
 # ============================================================
-# AI
+# NEXORA INTELLIGENCE
 # ============================================================
 
-elif menu == "AI Assistant":
+elif menu == "Nexora Intelligence":
 
-    st.header("Nexora Legal AI Assistant")
-
+    st.header("Nexora Intelligence")
     st.markdown("""
     <div class="nx-soft">
-        Use this tab for drafting assistance, summaries and internal practice support.
+        Intelligent matter support grounded in the firm's authorised client and matter data.
+        Drafts and analyses require practitioner review before use.
     </div>
     """, unsafe_allow_html=True)
 
-    # The actual OpenAI key is NOT stored in this file.
-    # Nexora reads it from the OPENAI_API_KEY environment variable.
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    intelligence_tabs = st.tabs([
+        "✍️ Draft",
+        "🔎 Review",
+        "🧠 Matter Intelligence",
+        "💬 Ask Nexora",
+    ])
 
-    query = st.text_area(
-        "Question / Instruction",
-        height=180
-    )
+    # Shared searchable client -> matter selection.
+    all_clients = db.list_clients(org_id)
 
-    if st.button("Generate AI Response"):
+    with intelligence_tabs[0]:
+        st.subheader("Draft a Legal Document")
+        st.caption("Select the client first, then the matter. Nexora uses recorded facts and asks you to supply anything missing or changeable.")
 
-        if not query.strip():
-            st.warning("Enter a question first.")
-
-        elif not api_key:
-            st.warning(
-                "OPENAI_API_KEY is not configured. "
-                "Set it in PowerShell before starting Nexora."
-            )
-
-        elif not OpenAI:
-            st.warning(
-                "The OpenAI Python package is not installed."
-            )
-
+        if not all_clients:
+            st.info("Register a client before using matter-aware drafting.")
         else:
-            try:
-                client = OpenAI(api_key=api_key)
+            client_search = st.text_input("Search Client", key="intel_draft_client_search", placeholder="Client name or client number")
+            filtered_clients = [
+                c for c in all_clients
+                if not client_search.strip()
+                or client_search.lower() in str(c.get("name") or "").lower()
+                or client_search.lower() in str(c.get("client_number") or "").lower()
+            ]
+            if not filtered_clients:
+                st.warning("No client matches that search.")
+            else:
+                client_map = {f"{c['client_number']} — {c['name']}": c for c in filtered_clients}
+                selected_client = client_map[st.selectbox("Client", list(client_map.keys()), key="intel_draft_client")]
+                client_matters = db.list_matters(org_id, client_id=selected_client["id"])
 
-                prompt = f"""
-You are Nexora Legal AI.
+                if not client_matters:
+                    st.info("This client has no matters yet.")
+                else:
+                    matter_map = {f"{m['matter_number']} — {m['title']}": m for m in client_matters}
+                    selected_matter = matter_map[st.selectbox("Matter", list(matter_map.keys()), key="intel_draft_matter")]
+                    document_type = st.selectbox(
+                        "Document Type",
+                        _document_types_for_matter(selected_matter.get("matter_type")),
+                        key="intel_document_type"
+                    )
+                    st.markdown("#### Information Nexora already has")
+                    known_cols = st.columns(3)
+                    known_cols[0].caption(f"**Client:** {selected_client.get('client_number')} — {selected_client.get('name')}")
+                    known_cols[1].caption(f"**Matter:** {selected_matter.get('matter_number')} — {selected_matter.get('title')}")
+                    known_cols[2].caption(f"**Matter type:** {selected_matter.get('matter_type') or 'Not recorded'}")
+                    if selected_matter.get("particulars"):
+                        st.caption(f"**Recorded particulars:** {selected_matter.get('particulars')}")
 
-You are assisting {user_name}, a {attorney_level}, at
-{firm_name}, Nexora firm number {firm_number}.
+                    requirement_fields = _draft_requirements_for_document(
+                        document_type,
+                        selected_matter.get("matter_type"),
+                        selected_client,
+                        selected_matter,
+                    )
+                    st.markdown(f"#### Information for {document_type}")
+                    st.caption(
+                        "Nexora has prefilled information it already knows. Complete what you have; "
+                        "leave anything unknown blank and Nexora will use a clear placeholder in the draft."
+                    )
+                    draft_answers = {}
+                    for item in requirement_fields:
+                        label = item["label"] + (" *" if item.get("required") else "")
+                        draft_answers[item["key"]] = st.text_input(
+                            label,
+                            value=str(item.get("value") or ""),
+                            help=item.get("help") or None,
+                            key=f"intel_req_{selected_matter['id']}_{re.sub(r'[^A-Za-z0-9]+', '_', document_type)}_{item['key']}",
+                        )
 
-You are an internal legal-practice assistant.
+                    missing_required = [
+                        item["label"] for item in requirement_fields
+                        if item.get("required") and not str(draft_answers.get(item["key"]) or "").strip()
+                    ]
+                    if missing_required:
+                        st.info(
+                            "Still missing: " + ", ".join(missing_required) +
+                            ". You may complete them now or generate with placeholders."
+                        )
 
-Rules:
-- Be professional and practical.
-- Never disclose information belonging to another law firm.
-- Do not invent client or matter facts.
-- Treat legal drafting as a draft for practitioner review.
-- If information is missing, say what is missing.
-- Do not claim that you performed an action inside Nexora.
+                    additional_facts = _draft_answers_text(requirement_fields, draft_answers)
+                    drafting_instruction = st.text_area(
+                        "Drafting Instruction (optional)",
+                        height=100,
+                        placeholder="Example: concise High Court style; include placeholders where a fact is still missing.",
+                        key="intel_draft_instruction"
+                    )
 
-USER REQUEST:
+                    if st.button("Generate Draft", key="intel_generate_draft", width="stretch"):
+                        tasks = db.list_tasks(org_id, matter_id=selected_matter["id"])
+                        docs = db.get_documents_for_matter(org_id, selected_matter["id"])
+                        context = _matter_context_text(selected_client, selected_matter, tasks, docs)
+                        system_prompt = f"""
+You are Nexora Intelligence, an internal legal-practice drafting assistant for {firm_name}.
+You are assisting {user_name}, practitioner type {attorney_level}.
 
-{query}
-"""
+MANDATORY RULES:
+- Use only the supplied authorised client/matter facts and the practitioner's additional facts.
+- Never invent names, dates, court details, accident details, monetary amounts, addresses, contract terms, evidence or procedural facts.
+- Where a required fact is absent, insert a clear [MISSING: ...] placeholder rather than guessing.
+- Produce a professional South African legal-practice draft appropriate to the selected document type and matter context.
+- Do not state that a filing, service, submission, verification or other legal action has occurred unless the supplied facts expressly say so.
+- End with the line: DRAFT – PRACTITIONER REVIEW REQUIRED.
+""".strip()
+                        user_prompt = f"""
+DOCUMENT TYPE: {document_type}
 
-                response = client.responses.create(
-                    model="gpt-5.6-luna",
-                    input=prompt
-                )
+AUTHORISED NEXORA MATTER CONTEXT:
+{context}
 
-                st.markdown(response.output_text)
+DOCUMENT-SPECIFIC INFORMATION CONFIRMED / SUPPLIED BY PRACTITIONER:
+{additional_facts}
 
-            except Exception as e:
-                st.error(
-                    f"AI service error: {e}"
-                )
+SPECIAL DRAFTING INSTRUCTION:
+{drafting_instruction or '[None supplied]'}
+
+Use the document-specific information above together with the authorised matter context. Produce the draft directly. Where a required fact is marked [MISSING] or is genuinely absent, use a clear [MISSING: ...] placeholder and do not invent it.
+""".strip()
+                        try:
+                            with st.spinner("Generating matter-aware draft..."):
+                                draft_text = _nexora_openai_text(api_key, system_prompt, user_prompt)
+                            st.session_state.intel_last_draft = draft_text
+                            st.session_state.intel_last_draft_name = f"{selected_matter['matter_number']}_{re.sub(r'[^A-Za-z0-9]+', '_', document_type).strip('_')}.txt"
+                        except Exception as e:
+                            st.error(f"Nexora Intelligence error: {e}")
+
+                    if st.session_state.get("intel_last_draft"):
+                        st.markdown("### Generated Draft")
+                        st.text_area("Draft", value=st.session_state.intel_last_draft, height=500, key="intel_draft_output")
+                        st.download_button(
+                            "Download Draft",
+                            data=st.session_state.intel_last_draft,
+                            file_name=st.session_state.get("intel_last_draft_name", "nexora_draft.txt"),
+                            mime="text/plain",
+                            width="stretch",
+                        )
+                        st.warning("Draft – Practitioner Review Required")
+
+    with intelligence_tabs[1]:
+        st.subheader("Review a Document")
+        st.caption("Paste document text for structured review. Nexora will not assume that the text is accurate or complete.")
+        review_text = st.text_area("Document Text", height=300, key="intel_review_text")
+        review_focus = st.text_input(
+            "Review Focus (optional)",
+            placeholder="Example: obligations, deadlines, inconsistencies, missing clauses, RAF litigation issues",
+            key="intel_review_focus"
+        )
+        if st.button("Review Document", key="intel_review_button", width="stretch"):
+            if not review_text.strip():
+                st.warning("Paste the document text first.")
+            else:
+                system_prompt = f"""
+You are Nexora Intelligence assisting {user_name} at {firm_name}.
+Review supplied legal text for internal practitioner support.
+Do not invent facts or legal actions. Distinguish what the document says from your observations.
+Return: Executive Summary; Key Parties/Obligations; Dates & Deadlines; Financial Terms (if any); Issues / Gaps; Practitioner Review Points.
+This is internal assistance and requires practitioner review.
+""".strip()
+                try:
+                    with st.spinner("Reviewing document..."):
+                        st.session_state.intel_last_review = _nexora_openai_text(
+                            api_key,
+                            system_prompt,
+                            f"REVIEW FOCUS: {review_focus or 'General structured review'}\n\nDOCUMENT TEXT:\n{review_text}"
+                        )
+                except Exception as e:
+                    st.error(f"Nexora Intelligence error: {e}")
+        if st.session_state.get("intel_last_review"):
+            st.markdown(st.session_state.intel_last_review)
+
+    with intelligence_tabs[2]:
+        st.subheader("Matter Intelligence")
+        if not all_clients:
+            st.info("Register a client first.")
+        else:
+            client_map = {f"{c['client_number']} — {c['name']}": c for c in all_clients}
+            mi_client = client_map[st.selectbox("Client", list(client_map.keys()), key="intel_mi_client")]
+            mi_matters = db.list_matters(org_id, client_id=mi_client["id"])
+            if not mi_matters:
+                st.info("This client has no matters.")
+            else:
+                matter_map = {f"{m['matter_number']} — {m['title']}": m for m in mi_matters}
+                mi_matter = matter_map[st.selectbox("Matter", list(matter_map.keys()), key="intel_mi_matter")]
+                if st.button("Analyse Matter", key="intel_mi_button", width="stretch"):
+                    tasks = db.list_tasks(org_id, matter_id=mi_matter["id"])
+                    docs = db.get_documents_for_matter(org_id, mi_matter["id"])
+                    context = _matter_context_text(mi_client, mi_matter, tasks, docs)
+                    system_prompt = f"""
+You are Nexora Intelligence, providing internal matter intelligence to {user_name} at {firm_name}.
+Use only the supplied Nexora matter data. Never invent facts, evidence, dates or completed actions.
+Return a structured report: Matter Snapshot; Current Position; Outstanding Tasks & Deadlines; Documents on File; Apparent Information Gaps; Suggested Practitioner Next Actions.
+Suggestions must be framed as practitioner considerations, not autonomous legal decisions.
+""".strip()
+                    try:
+                        with st.spinner("Analysing matter..."):
+                            st.session_state.intel_last_matter = _nexora_openai_text(api_key, system_prompt, context)
+                    except Exception as e:
+                        st.error(f"Nexora Intelligence error: {e}")
+                if st.session_state.get("intel_last_matter"):
+                    st.markdown(st.session_state.intel_last_matter)
+
+    with intelligence_tabs[3]:
+        st.subheader("Ask Nexora")
+        st.caption("Use general practice support, or attach the question to an authorised matter context.")
+        use_matter = st.checkbox("Use a client/matter context", key="intel_ask_use_matter")
+        ask_context = ""
+        if use_matter and all_clients:
+            client_map = {f"{c['client_number']} — {c['name']}": c for c in all_clients}
+            ask_client = client_map[st.selectbox("Client", list(client_map.keys()), key="intel_ask_client")]
+            ask_matters = db.list_matters(org_id, client_id=ask_client["id"])
+            if ask_matters:
+                matter_map = {f"{m['matter_number']} — {m['title']}": m for m in ask_matters}
+                ask_matter = matter_map[st.selectbox("Matter", list(matter_map.keys()), key="intel_ask_matter")]
+                tasks = db.list_tasks(org_id, matter_id=ask_matter["id"])
+                docs = db.get_documents_for_matter(org_id, ask_matter["id"])
+                ask_context = _matter_context_text(ask_client, ask_matter, tasks, docs)
+            else:
+                st.info("Selected client has no matters.")
+
+        question = st.text_area("Question / Instruction", height=180, key="intel_ask_question")
+        if st.button("Ask Nexora", key="intel_ask_button", width="stretch"):
+            if not question.strip():
+                st.warning("Enter a question first.")
+            else:
+                system_prompt = f"""
+You are Nexora Intelligence, an internal legal-practice assistant for {firm_name}, assisting {user_name} ({attorney_level}).
+Be professional and practical. Never disclose another firm's information. Never invent client or matter facts.
+If matter context is supplied, distinguish recorded Nexora facts from general guidance.
+Treat drafting and legal analysis as practitioner-support output requiring professional review.
+Do not claim that you performed an action inside Nexora.
+""".strip()
+                prompt = question
+                if ask_context:
+                    prompt = f"AUTHORISED MATTER CONTEXT:\n{ask_context}\n\nPRACTITIONER QUESTION:\n{question}"
+                try:
+                    with st.spinner("Nexora is working..."):
+                        st.session_state.intel_last_answer = _nexora_openai_text(api_key, system_prompt, prompt)
+                except Exception as e:
+                    st.error(f"Nexora Intelligence error: {e}")
+        if st.session_state.get("intel_last_answer"):
+            st.markdown(st.session_state.intel_last_answer)
 
 
 # ============================================================
