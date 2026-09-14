@@ -194,6 +194,74 @@ DEFAULT_SERVICES = [
 ]
 
 
+
+
+MATTER_TYPE_CODES = {
+    "Litigation": "LIT",
+    "Road Accident Fund (RAF)": "RAF",
+    "Criminal Law": "CRIM",
+    "Divorce / Family Law": "DIV",
+    "Labour Law": "LAB",
+    "Medical Negligence": "MED",
+    "Commercial Law": "COM",
+    "Debt Collection": "DEBT",
+    "Estates / Wills": "EST",
+    "Property / Conveyancing": "CONV",
+    "Corporate / Company Law": "CORP",
+    "Insurance Law": "INS",
+    "Personal Injury": "PI",
+    "Administrative Law": "ADM",
+    "Immigration": "IMM",
+    "Tax": "TAX",
+    "Other": "OTH",
+}
+
+SERVICE_CODES = {
+    "Taking Instructions": "ATI",
+    "Consultation": "CON",
+    "Drafting Correspondence": "DCO",
+    "Drafting Pleadings": "DPL",
+    "Court Preparation": "CPR",
+    "Court Appearance": "CAP",
+    "Legal Research": "RES",
+    "Telephone Call": "TEL",
+    "Email Correspondence": "EML",
+    "Review of Documents": "REV",
+    "File Administration": "ADM",
+    "Settlement Negotiation": "SET",
+    "Client Update": "UPD",
+    "Briefing Counsel": "BRC",
+    "Attending Consultation": "ACO",
+    "Travel / Attendance": "TRV",
+    "Other": "OTH",
+}
+
+
+def _compact_code(name, fallback="GEN", max_len=4):
+    name = str(name or "").strip()
+    if not name:
+        return fallback
+    words = re.findall(r"[A-Za-z0-9]+", name.upper())
+    if len(words) >= 2:
+        return "".join(word[0] for word in words[:max_len])[:max_len]
+    if words:
+        return words[0][:max_len]
+    return fallback
+
+
+def _firm_identity(firm_number):
+    match = re.search(r"(\d+)$", str(firm_number or ""))
+    return (match.group(1).zfill(3) if match else "000")
+
+
+def _matter_type_code(name):
+    return MATTER_TYPE_CODES.get(str(name or "").strip()) or _compact_code(name, "MAT")
+
+
+def _service_code(name):
+    return SERVICE_CODES.get(str(name or "").strip()) or _compact_code(name, "TSK")
+
+
 def _seed_default_setup(conn, org_id):
     """Add Nexora defaults without overwriting a firm's existing setup."""
     for name in DEFAULT_MATTER_TYPES:
@@ -1184,15 +1252,19 @@ def create_client(
                 "Add at least one SLA Service + Practitioner Type rate before registering the client."
             )
 
-        year = date.today().year
-        client_number = _next_number(
-            conn.cursor(),
-            "clients",
-            "client_number",
-            org_id,
-            f"{org['firm_number']}-CLI-{year}-",
-            4
-        )
+        # Permanent hierarchical client identity.
+        # NEX-001 -> first client 001-001, second 001-002, etc.
+        firm_part = _firm_identity(org["firm_number"])
+        rows = conn.execute(
+            "SELECT client_number FROM clients WHERE org_id=?",
+            (org_id,)
+        ).fetchall()
+        client_sequences = []
+        for row in rows:
+            match = re.match(rf"^{re.escape(firm_part)}-(\d+)$", str(row["client_number"] or ""))
+            if match:
+                client_sequences.append(int(match.group(1)))
+        client_number = f"{firm_part}-{max(client_sequences, default=0) + 1:03d}"
 
         cur = conn.execute("""
             INSERT INTO clients(
@@ -1526,111 +1598,54 @@ def create_matter(
             "SELECT firm_number FROM organizations WHERE id=?",
             (org_id,)
         ).fetchone()
-
         if not org:
             raise ValueError("Firm not found.")
 
-        if not conn.execute(
-            "SELECT id FROM clients WHERE id=? AND org_id=?",
+        client = conn.execute(
+            "SELECT id, client_number FROM clients WHERE id=? AND org_id=?",
             (client_id, org_id)
-        ).fetchone():
+        ).fetchone()
+        if not client:
             raise ValueError("Client does not belong to this firm.")
 
-        if not conn.execute("""
-            SELECT id FROM matter_types
+        matter_type = conn.execute("""
+            SELECT id, name FROM matter_types
             WHERE id=? AND org_id=? AND active=1
-        """, (matter_type_id, org_id)).fetchone():
+        """, (matter_type_id, org_id)).fetchone()
+        if not matter_type:
             raise ValueError("Matter type does not belong to this firm.")
 
-        # Generate a readable matter number from Matter Type + Client + Sequence.
-        # Example: client ...-001 + Divorce / Family Law -> DIV-001-01
-        client = conn.execute(
-            "SELECT client_number FROM clients WHERE id=? AND org_id=?",
-            (client_id, org_id)
-        ).fetchone()
-        matter_type = conn.execute(
-            "SELECT name FROM matter_types WHERE id=? AND org_id=?",
-            (matter_type_id, org_id)
-        ).fetchone()
+        # Hierarchical matter identity: CLIENT-MATTERTYPE.
+        # First RAF matter: 001-001-RAF
+        # If the same client later has another RAF matter: 001-001-RAF-02
+        type_code = _matter_type_code(matter_type["name"])
+        base_number = f"{client['client_number']}-{type_code}"
 
-        if not client or not matter_type:
-            raise ValueError("Client or matter type could not be found.")
+        existing = conn.execute("""
+            SELECT matter_number
+            FROM matters
+            WHERE org_id=? AND client_id=? AND matter_type_id=?
+            ORDER BY id
+        """, (org_id, client_id, matter_type_id)).fetchall()
 
-        type_codes = {
-            "Litigation": "LIT",
-            "Road Accident Fund (RAF)": "RAF",
-            "Criminal Law": "CRIM",
-            "Divorce / Family Law": "DIV",
-            "Labour Law": "LAB",
-            "Medical Negligence": "MED",
-            "Commercial Law": "COM",
-            "Debt Collection": "DEBT",
-            "Estates / Wills": "EST",
-            "Property / Conveyancing": "CONV",
-            "Corporate / Company Law": "CORP",
-            "Insurance Law": "INS",
-            "Personal Injury": "PI",
-            "Administrative Law": "ADM",
-            "Immigration": "IMM",
-            "Tax": "TAX",
-            "Other": "OTH",
-        }
-
-        type_name = str(matter_type["name"] or "Other").strip()
-        type_code = type_codes.get(type_name)
-        if not type_code:
-            # Firm-created matter types also work automatically.
-            words = re.findall(r"[A-Za-z0-9]+", type_name.upper())
-            if len(words) >= 2:
-                type_code = "".join(word[0] for word in words[:4])
-            elif words:
-                type_code = words[0][:4]
-            else:
-                type_code = "MAT"
-
-        client_number = str(client["client_number"] or "").strip()
-        client_match = re.search(r"(\d+)$", client_number)
-        if not client_match:
-            raise ValueError("Client number does not contain a numeric client identifier.")
-        client_part = client_match.group(1).lstrip("0") or "0"
-        client_part = client_part.zfill(3)
-
-        prefix = f"{type_code}-{client_part}-"
-        existing = conn.execute(
-            "SELECT matter_number FROM matters WHERE org_id=? AND client_id=? AND matter_type_id=? AND matter_number LIKE ?",
-            (org_id, client_id, matter_type_id, prefix + "%")
-        ).fetchall()
-
-        sequences = []
-        for row in existing:
-            match = re.search(r"-(\d+)$", str(row["matter_number"] or ""))
-            if match:
-                sequences.append(int(match.group(1)))
-
-        matter_number = f"{prefix}{max(sequences, default=0) + 1:02d}"
+        used = {str(row["matter_number"] or "") for row in existing}
+        if base_number not in used:
+            matter_number = base_number
+        else:
+            sequence = 2
+            while f"{base_number}-{sequence:02d}" in used:
+                sequence += 1
+            matter_number = f"{base_number}-{sequence:02d}"
 
         cur = conn.execute("""
             INSERT INTO matters(
-                org_id,
-                client_id,
-                matter_type_id,
-                matter_number,
-                title,
-                status,
-                priority,
-                particulars,
-                opened_by
+                org_id, client_id, matter_type_id, matter_number, title,
+                status, priority, particulars, opened_by
             )
             VALUES (?, ?, ?, ?, ?, 'Open', ?, ?, ?)
         """, (
-            org_id,
-            client_id,
-            matter_type_id,
-            matter_number,
-            title,
-            priority,
-            particulars,
-            opened_by
+            org_id, client_id, matter_type_id, matter_number, title,
+            priority, particulars, opened_by
         ))
 
         conn.commit()
@@ -1639,7 +1654,6 @@ def create_matter(
     except Exception:
         conn.rollback()
         raise
-
     finally:
         conn.close()
 
@@ -1754,18 +1768,11 @@ def create_task(
     conn = get_connection()
 
     try:
-        org = conn.execute(
-            "SELECT firm_number FROM organizations WHERE id=?",
-            (org_id,)
-        ).fetchone()
-
-        if not org:
-            raise ValueError("Firm not found.")
-
-        if not conn.execute(
-            "SELECT id FROM matters WHERE id=? AND org_id=?",
+        matter = conn.execute(
+            "SELECT id, matter_number FROM matters WHERE id=? AND org_id=?",
             (matter_id, org_id)
-        ).fetchone():
+        ).fetchone()
+        if not matter:
             raise ValueError("Matter does not belong to this firm.")
 
         user = conn.execute("""
@@ -1773,55 +1780,48 @@ def create_task(
             FROM users
             WHERE id=? AND org_id=? AND active=1
         """, (user_id, org_id)).fetchone()
-
         if not user:
             raise ValueError("Practitioner does not belong to this firm.")
-
         if not user["practitioner_type_id"]:
             raise ValueError("Practitioner type is not configured.")
 
-        if not conn.execute("""
-            SELECT id
+        service = conn.execute("""
+            SELECT id, name
             FROM services
             WHERE id=? AND org_id=? AND active=1
-        """, (service_id, org_id)).fetchone():
+        """, (service_id, org_id)).fetchone()
+        if not service:
             raise ValueError("Task Type / Service does not belong to this firm.")
 
-        year = date.today().year
-        task_number = _next_number(
-            conn.cursor(),
-            "tasks",
-            "task_number",
-            org_id,
-            f"{org['firm_number']}-TSK-{year}-",
-            6
-        )
+        # Task inherits its matter identity.
+        # First Taking Instructions task: 001-001-RAF-ATI
+        # Repeated Taking Instructions task: 001-001-RAF-ATI-02
+        service_code = _service_code(service["name"])
+        base_number = f"{matter['matter_number']}-{service_code}"
+        existing = conn.execute("""
+            SELECT task_number FROM tasks
+            WHERE org_id=? AND matter_id=? AND service_id=?
+            ORDER BY id
+        """, (org_id, matter_id, service_id)).fetchall()
+        used = {str(row["task_number"] or "") for row in existing}
+        if base_number not in used:
+            task_number = base_number
+        else:
+            sequence = 2
+            while f"{base_number}-{sequence:02d}" in used:
+                sequence += 1
+            task_number = f"{base_number}-{sequence:02d}"
 
         cur = conn.execute("""
             INSERT INTO tasks(
-                org_id,
-                matter_id,
-                task_number,
-                user_id,
-                service_id,
-                practitioner_type_id,
-                title,
-                tat_days,
-                due_date,
-                status,
-                billing_status
+                org_id, matter_id, task_number, user_id, service_id,
+                practitioner_type_id, title, tat_days, due_date,
+                status, billing_status
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'Pending', 'Unbilled')
         """, (
-            org_id,
-            matter_id,
-            task_number,
-            user_id,
-            service_id,
-            user["practitioner_type_id"],
-            title,
-            tat_days,
-            due_date
+            org_id, matter_id, task_number, user_id, service_id,
+            user["practitioner_type_id"], title, tat_days, due_date
         ))
 
         conn.commit()
@@ -1830,10 +1830,8 @@ def create_task(
     except Exception:
         conn.rollback()
         raise
-
     finally:
         conn.close()
-
 
 def list_tasks(org_id, matter_id=None, user_id=None):
     conn = get_connection()
