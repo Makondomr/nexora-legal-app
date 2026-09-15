@@ -2034,9 +2034,9 @@ def list_unbilled_tasks(org_id, client_id=None):
         FROM tasks t
         JOIN matters m ON m.id=t.matter_id
         JOIN clients c ON c.id=m.client_id
-        JOIN users u ON u.id=t.user_id
-        JOIN practitioner_types pt ON pt.id=t.practitioner_type_id
-        JOIN services s ON s.id=t.service_id
+        LEFT JOIN users u ON u.id=t.user_id
+        LEFT JOIN practitioner_types pt ON pt.id=t.practitioner_type_id
+        LEFT JOIN services s ON s.id=t.service_id
         WHERE t.org_id=?
           AND t.status='Complete'
           AND t.billing_status='Unbilled'
