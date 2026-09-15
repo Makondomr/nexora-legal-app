@@ -2020,6 +2020,12 @@ def complete_task(org_id, task_id, quantity, completion_notes, disbursement_amou
         conn.close()
 
 def list_unbilled_tasks(org_id, client_id=None):
+    """Return completed, unbilled tasks for invoicing.
+
+    Production-safe PostgreSQL version: the eligibility decision is based only
+    on the task and its matter/client ownership. Descriptive lookups are LEFT
+    JOINs so legacy or missing reference rows cannot hide a valid billable task.
+    """
     conn = get_connection()
 
     sql = """
@@ -2027,19 +2033,29 @@ def list_unbilled_tasks(org_id, client_id=None):
             t.*,
             m.client_id,
             m.matter_number,
-            c.name AS client_name,
-            u.name AS practitioner_name,
-            pt.name AS practitioner_type,
-            s.name AS service_name
+            COALESCE(c.name, '') AS client_name,
+            COALESCE(u.name, 'Unknown Practitioner') AS practitioner_name,
+            COALESCE(pt.name, 'Unspecified') AS practitioner_type,
+            COALESCE(s.name, t.title, 'Task') AS service_name
         FROM tasks t
-        JOIN matters m ON m.id=t.matter_id
-        JOIN clients c ON c.id=m.client_id
-        LEFT JOIN users u ON u.id=t.user_id
-        LEFT JOIN practitioner_types pt ON pt.id=t.practitioner_type_id
-        LEFT JOIN services s ON s.id=t.service_id
+        JOIN matters m
+          ON m.id=t.matter_id
+         AND m.org_id=t.org_id
+        LEFT JOIN clients c
+          ON c.id=m.client_id
+         AND c.org_id=t.org_id
+        LEFT JOIN users u
+          ON u.id=t.user_id
+         AND u.org_id=t.org_id
+        LEFT JOIN practitioner_types pt
+          ON pt.id=t.practitioner_type_id
+         AND pt.org_id=t.org_id
+        LEFT JOIN services s
+          ON s.id=t.service_id
+         AND s.org_id=t.org_id
         WHERE t.org_id=?
-          AND t.status='Complete'
-          AND t.billing_status='Unbilled'
+          AND TRIM(COALESCE(t.status, ''))='Complete'
+          AND TRIM(COALESCE(t.billing_status, ''))='Unbilled'
     """
     params = [org_id]
 
