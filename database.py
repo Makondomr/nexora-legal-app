@@ -1,42 +1,52 @@
 import os
 import re
-import sqlite3
 from datetime import datetime, date
-from pathlib import Path
 
-IntegrityError = sqlite3.IntegrityError
+import psycopg2
+from psycopg2 import IntegrityError
+from psycopg2.extras import RealDictCursor
 
-BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = Path(os.getenv("NEXORA_SQLITE_PATH", str(BASE_DIR / "nexora_local.db")))
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
 
 # ============================================================
-# SQLITE LOCAL DEVELOPMENT CONNECTION
+# POSTGRESQL CONNECTION / SQLITE-COMPATIBILITY HELPERS
 # ============================================================
 
-class SQLiteCursorCompat:
+def _translate_sql(sql):
+    sql = str(sql)
+    sql = sql.replace("?", "%s")
+    was_ignore = bool(re.search(r"\bINSERT\s+OR\s+IGNORE\s+INTO\b", sql, re.I))
+    if was_ignore:
+        sql = re.sub(r"\bINSERT\s+OR\s+IGNORE\s+INTO\b", "INSERT INTO", sql, flags=re.I)
+        stripped = sql.rstrip().rstrip(";")
+        if not re.search(r"\bON\s+CONFLICT\b", stripped, re.I):
+            sql = stripped + " ON CONFLICT DO NOTHING"
+    return sql
+
+
+class PGCursorCompat:
     def __init__(self, raw_cursor):
         self.raw = raw_cursor
-
-    @property
-    def lastrowid(self):
-        return self.raw.lastrowid
+        self.lastrowid = None
 
     @property
     def rowcount(self):
         return self.raw.rowcount
 
     def execute(self, sql, params=None):
-        sql = str(sql)
-        # The production file uses PostgreSQL types. SQLite accepts most type names,
-        # but BIGSERIAL must become a true INTEGER PRIMARY KEY for reliable IDs.
-        sql = re.sub(r"\bBIGSERIAL\s+PRIMARY\s+KEY\b", "INTEGER PRIMARY KEY AUTOINCREMENT", sql, flags=re.I)
-        sql = re.sub(r"\bBIGINT\b", "INTEGER", sql, flags=re.I)
-        sql = re.sub(r"\bDOUBLE\s+PRECISION\b", "REAL", sql, flags=re.I)
+        translated = _translate_sql(sql)
+        is_insert = bool(re.match(r"^\s*INSERT\b", translated, re.I))
+        if is_insert and not re.search(r"\bRETURNING\b", translated, re.I):
+            translated = translated.rstrip().rstrip(";") + " RETURNING id"
         if params is None:
-            self.raw.execute(sql)
+            self.raw.execute(translated)
         else:
-            self.raw.execute(sql, params)
+            self.raw.execute(translated, params)
+        if is_insert:
+            row = self.raw.fetchone()
+            if row:
+                self.lastrowid = row.get("id") if isinstance(row, dict) else row[0]
         return self
 
     def fetchone(self):
@@ -49,15 +59,16 @@ class SQLiteCursorCompat:
         self.raw.close()
 
 
-class SQLiteConnectionCompat:
+class PGConnectionCompat:
     def __init__(self, raw):
         self.raw = raw
 
     def cursor(self):
-        return SQLiteCursorCompat(self.raw.cursor())
+        return PGCursorCompat(self.raw.cursor(cursor_factory=RealDictCursor))
 
     def execute(self, sql, params=None):
-        return self.cursor().execute(sql, params)
+        cur = self.cursor()
+        return cur.execute(sql, params)
 
     def commit(self):
         self.raw.commit()
@@ -70,10 +81,12 @@ class SQLiteConnectionCompat:
 
 
 def get_connection():
-    raw = sqlite3.connect(DB_PATH)
-    raw.row_factory = sqlite3.Row
-    raw.execute("PRAGMA foreign_keys = ON")
-    return SQLiteConnectionCompat(raw)
+    if not DATABASE_URL:
+        raise RuntimeError(
+            "DATABASE_URL is not configured. Set it to your Render PostgreSQL URL."
+        )
+    raw = psycopg2.connect(DATABASE_URL, sslmode="require")
+    return PGConnectionCompat(raw)
 
 
 def normalize_cell(cell):
@@ -93,12 +106,21 @@ def rows_to_dicts(rows):
 
 
 def _column_exists(conn, table, column):
-    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
-    return any(str(row["name"]) == str(column) for row in rows)
+    row = conn.execute(
+        """
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema='public' AND table_name=%s AND column_name=%s
+        LIMIT 1
+        """,
+        (table, column),
+    ).fetchone()
+    return bool(row)
 
 
 def _add_column_if_missing(conn, table, column, definition):
     if not _column_exists(conn, table, column):
+        definition = definition.replace("REAL", "DOUBLE PRECISION")
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
@@ -129,6 +151,53 @@ def _next_number(cursor, table, column, org_id, prefix, width):
             pass
 
     return f"{prefix}{max(nums, default=0) + 1:0{width}d}"
+
+
+# ============================================================
+# DEFAULT NEXORA SETUP DATA
+# ============================================================
+
+DEFAULT_MATTER_TYPES = [
+    "Litigation",
+    "Road Accident Fund (RAF)",
+    "Criminal Law",
+    "Divorce / Family Law",
+    "Labour Law",
+    "Medical Negligence",
+    "Commercial Law",
+    "Debt Collection",
+    "Estates / Wills",
+    "Property / Conveyancing",
+    "Corporate / Company Law",
+    "Insurance Law",
+    "Personal Injury",
+    "Administrative Law",
+    "Immigration",
+    "Tax",
+    "Other",
+]
+
+DEFAULT_SERVICES = [
+    ("Taking Instructions", "Initial instructions received from the client or correspondent.", "Hour"),
+    ("Consultation", "Client, witness, expert or other professional consultation.", "Hour"),
+    ("Drafting Correspondence", "Drafting letters, notices and formal correspondence.", "Hour"),
+    ("Drafting Pleadings", "Drafting pleadings, notices, affidavits and litigation documents.", "Hour"),
+    ("Court Preparation", "Preparation for a hearing, trial, motion or court appearance.", "Hour"),
+    ("Court Appearance", "Attendance and appearance at court or tribunal proceedings.", "Hour"),
+    ("Legal Research", "Legal research, authorities and case-law preparation.", "Hour"),
+    ("Telephone Call", "Billable telephone consultation or matter-related call.", "Hour"),
+    ("Email Correspondence", "Billable email correspondence relating to the matter.", "Hour"),
+    ("Review of Documents", "Review and analysis of documents, records or evidence.", "Hour"),
+    ("File Administration", "Matter administration, file management and procedural administration.", "Hour"),
+    ("Settlement Negotiation", "Settlement discussions, negotiations and related preparation.", "Hour"),
+    ("Client Update", "Providing a substantive progress update to the client.", "Hour"),
+    ("Briefing Counsel", "Preparation of a brief and instructions to counsel or another specialist.", "Hour"),
+    ("Attending Consultation", "Attendance at a consultation, meeting, inspection or conference.", "Hour"),
+    ("Travel / Attendance", "Matter-related travel or attendance where billable under the firm's rules.", "Hour"),
+    ("Other", "Other billable legal service not covered by the standard service list.", "Hour"),
+]
+
+
 
 
 MATTER_TYPE_CODES = {
@@ -195,51 +264,6 @@ def _matter_type_code(name):
 
 def _service_code(name):
     return SERVICE_CODES.get(str(name or "").strip()) or _compact_code(name, "TSK")
-
-
-# ============================================================
-# DEFAULT NEXORA SETUP DATA
-# ============================================================
-
-DEFAULT_MATTER_TYPES = [
-    "Litigation",
-    "Road Accident Fund (RAF)",
-    "Criminal Law",
-    "Divorce / Family Law",
-    "Labour Law",
-    "Medical Negligence",
-    "Commercial Law",
-    "Debt Collection",
-    "Estates / Wills",
-    "Property / Conveyancing",
-    "Corporate / Company Law",
-    "Insurance Law",
-    "Personal Injury",
-    "Administrative Law",
-    "Immigration",
-    "Tax",
-    "Other",
-]
-
-DEFAULT_SERVICES = [
-    ("Taking Instructions", "Initial instructions received from the client or correspondent.", "Hour"),
-    ("Consultation", "Client, witness, expert or other professional consultation.", "Hour"),
-    ("Drafting Correspondence", "Drafting letters, notices and formal correspondence.", "Hour"),
-    ("Drafting Pleadings", "Drafting pleadings, notices, affidavits and litigation documents.", "Hour"),
-    ("Court Preparation", "Preparation for a hearing, trial, motion or court appearance.", "Hour"),
-    ("Court Appearance", "Attendance and appearance at court or tribunal proceedings.", "Hour"),
-    ("Legal Research", "Legal research, authorities and case-law preparation.", "Hour"),
-    ("Telephone Call", "Billable telephone consultation or matter-related call.", "Hour"),
-    ("Email Correspondence", "Billable email correspondence relating to the matter.", "Hour"),
-    ("Review of Documents", "Review and analysis of documents, records or evidence.", "Hour"),
-    ("File Administration", "Matter administration, file management and procedural administration.", "Hour"),
-    ("Settlement Negotiation", "Settlement discussions, negotiations and related preparation.", "Hour"),
-    ("Client Update", "Providing a substantive progress update to the client.", "Hour"),
-    ("Briefing Counsel", "Preparation of a brief and instructions to counsel or another specialist.", "Hour"),
-    ("Attending Consultation", "Attendance at a consultation, meeting, inspection or conference.", "Hour"),
-    ("Travel / Attendance", "Matter-related travel or attendance where billable under the firm's rules.", "Hour"),
-    ("Other", "Other billable legal service not covered by the standard service list.", "Hour"),
-]
 
 
 def _seed_default_setup(conn, org_id):
@@ -2000,6 +2024,12 @@ def complete_task(org_id, task_id, quantity, completion_notes, disbursement_amou
         conn.close()
 
 def list_unbilled_tasks(org_id, client_id=None):
+    """Return completed, unbilled tasks for invoicing.
+
+    Production-safe PostgreSQL version: the eligibility decision is based only
+    on the task and its matter/client ownership. Descriptive lookups are LEFT
+    JOINs so legacy or missing reference rows cannot hide a valid billable task.
+    """
     conn = get_connection()
 
     sql = """
@@ -2007,19 +2037,29 @@ def list_unbilled_tasks(org_id, client_id=None):
             t.*,
             m.client_id,
             m.matter_number,
-            c.name AS client_name,
-            u.name AS practitioner_name,
-            pt.name AS practitioner_type,
-            s.name AS service_name
+            COALESCE(c.name, '') AS client_name,
+            COALESCE(u.name, 'Unknown Practitioner') AS practitioner_name,
+            COALESCE(pt.name, 'Unspecified') AS practitioner_type,
+            COALESCE(s.name, t.title, 'Task') AS service_name
         FROM tasks t
-        JOIN matters m ON m.id=t.matter_id
-        JOIN clients c ON c.id=m.client_id
-        JOIN users u ON u.id=t.user_id
-        JOIN practitioner_types pt ON pt.id=t.practitioner_type_id
-        JOIN services s ON s.id=t.service_id
+        JOIN matters m
+          ON m.id=t.matter_id
+         AND m.org_id=t.org_id
+        LEFT JOIN clients c
+          ON c.id=m.client_id
+         AND c.org_id=t.org_id
+        LEFT JOIN users u
+          ON u.id=t.user_id
+         AND u.org_id=t.org_id
+        LEFT JOIN practitioner_types pt
+          ON pt.id=t.practitioner_type_id
+         AND pt.org_id=t.org_id
+        LEFT JOIN services s
+          ON s.id=t.service_id
+         AND s.org_id=t.org_id
         WHERE t.org_id=?
-          AND t.status='Complete'
-          AND t.billing_status='Unbilled'
+          AND TRIM(COALESCE(t.status, ''))='Complete'
+          AND TRIM(COALESCE(t.billing_status, ''))='Unbilled'
     """
     params = [org_id]
 
@@ -2139,44 +2179,6 @@ def fetch_email_logs(org_id):
 # INVOICES
 # ============================================================
 
-def get_suggested_invoice_number(org_id):
-    """Return the next firm-defined invoice number, without changing any data.
-
-    Nexora ignores historical system-generated NEX-... invoice numbers.
-    It finds the latest firm-defined invoice number that ends in digits and
-    increments only that trailing numeric sequence, preserving zero-padding.
-    """
-    conn = get_connection()
-    try:
-        rows = conn.execute("""
-            SELECT invoice_number
-            FROM invoices
-            WHERE org_id=?
-            ORDER BY id DESC
-        """, (org_id,)).fetchall()
-
-        for row in rows:
-            current = str(row["invoice_number"] or "").strip()
-            if not current:
-                continue
-
-            # Ignore Nexora's historical automatic invoice-number format.
-            if re.match(r"^NEX-\d+-INV-\d{4}-\d+$", current, flags=re.I):
-                continue
-
-            match = re.match(r"^(.*?)(\d+)$", current)
-            if not match:
-                continue
-
-            prefix, numeric_part = match.groups()
-            next_number = int(numeric_part) + 1
-            return f"{prefix}{next_number:0{len(numeric_part)}d}"
-
-        return ""
-    finally:
-        conn.close()
-
-
 def get_client_unbilled_billing_items(org_id, client_id):
     return {
         "tasks": list_unbilled_tasks(org_id, client_id=client_id),
@@ -2192,8 +2194,7 @@ def create_invoice(
     created_by,
     notes="",
     vat_rate=0,
-    payment_terms="",
-    invoice_number=""
+    payment_terms=""
 ):
     conn = get_connection()
 
@@ -2212,20 +2213,15 @@ def create_invoice(
         ).fetchone():
             raise ValueError("Client does not belong to this firm.")
 
-        invoice_number = str(invoice_number or "").strip()
-        if not invoice_number:
-            raise ValueError("Invoice number is required.")
-
-        existing_invoice = conn.execute("""
-            SELECT id
-            FROM invoices
-            WHERE org_id=? AND invoice_number=?
-        """, (org_id, invoice_number)).fetchone()
-
-        if existing_invoice:
-            raise ValueError(
-                f"Invoice number '{invoice_number}' already exists for this firm."
-            )
+        year = date.today().year
+        invoice_number = _next_number(
+            conn.cursor(),
+            "invoices",
+            "invoice_number",
+            org_id,
+            f"{org['firm_number']}-INV-{year}-",
+            4
+        )
 
         cur = conn.execute("""
             INSERT INTO invoices(
