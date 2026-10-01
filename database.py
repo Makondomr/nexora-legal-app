@@ -2186,6 +2186,46 @@ def get_client_unbilled_billing_items(org_id, client_id):
     }
 
 
+def get_suggested_invoice_number(org_id):
+    """Return the next firm-controlled invoice number suggestion.
+
+    The most recent custom invoice number ending in digits is incremented while
+    preserving its prefix and numeric width. Legacy Nexora-generated numbers
+    such as NEX-001-INV-2026-0001 are ignored. If no usable custom pattern
+    exists, return an empty string so the firm can enter its first number.
+    """
+    conn = get_connection()
+    try:
+        rows = conn.execute("""
+            SELECT invoice_number
+            FROM invoices
+            WHERE org_id=?
+              AND invoice_number IS NOT NULL
+              AND TRIM(invoice_number) <> ''
+            ORDER BY id DESC
+        """, (org_id,)).fetchall()
+
+        legacy_pattern = re.compile(r"^NEX-\d{3}-INV-\d{4}-\d{4}$", re.I)
+        trailing_number = re.compile(r"^(.*?)(\d+)$")
+
+        for row in rows:
+            value = str(row["invoice_number"] or "").strip()
+            if not value or legacy_pattern.fullmatch(value):
+                continue
+
+            match = trailing_number.match(value)
+            if not match:
+                continue
+
+            prefix, number_text = match.groups()
+            next_number = str(int(number_text) + 1).zfill(len(number_text))
+            return f"{prefix}{next_number}"
+
+        return ""
+    finally:
+        conn.close()
+
+
 def create_invoice(
     org_id,
     client_id,
@@ -2194,7 +2234,8 @@ def create_invoice(
     created_by,
     notes="",
     vat_rate=0,
-    payment_terms=""
+    payment_terms="",
+    invoice_number=None
 ):
     conn = get_connection()
 
@@ -2213,15 +2254,30 @@ def create_invoice(
         ).fetchone():
             raise ValueError("Client does not belong to this firm.")
 
-        year = date.today().year
-        invoice_number = _next_number(
-            conn.cursor(),
-            "invoices",
-            "invoice_number",
-            org_id,
-            f"{org['firm_number']}-INV-{year}-",
-            4
-        )
+        supplied_invoice_number = str(invoice_number or "").strip()
+
+        if supplied_invoice_number:
+            duplicate = conn.execute(
+                "SELECT id FROM invoices WHERE org_id=? AND invoice_number=? LIMIT 1",
+                (org_id, supplied_invoice_number)
+            ).fetchone()
+            if duplicate:
+                raise ValueError(
+                    f"Invoice number {supplied_invoice_number} already exists for this firm."
+                )
+            final_invoice_number = supplied_invoice_number
+        else:
+            # Backward-compatible fallback for older callers. The current UI
+            # supplies the firm's chosen number, but older screens can still work.
+            year = date.today().year
+            final_invoice_number = _next_number(
+                conn.cursor(),
+                "invoices",
+                "invoice_number",
+                org_id,
+                f"{org['firm_number']}-INV-{year}-",
+                4
+            )
 
         cur = conn.execute("""
             INSERT INTO invoices(
@@ -2245,7 +2301,7 @@ def create_invoice(
         """, (
             org_id,
             client_id,
-            invoice_number,
+            final_invoice_number,
             invoice_date,
             due_date,
             vat_rate,
@@ -2263,7 +2319,6 @@ def create_invoice(
 
     finally:
         conn.close()
-
 
 def add_task_to_invoice(org_id, invoice_id, task_id):
     conn = get_connection()
