@@ -2168,6 +2168,10 @@ elif menu == "Clients":
 
     st.header("Clients")
 
+    client_flash = st.session_state.pop("client_success_message", None)
+    if client_flash:
+        st.success(client_flash)
+
     st.markdown("""
     <div class="nx-soft">
         Register and manage clients here. General clients use the firm's General Fee Schedule.
@@ -2373,7 +2377,7 @@ elif menu == "Clients":
                     ]:
                         st.session_state.pop(key, None)
 
-                    st.success(
+                    st.session_state.client_success_message = (
                         f"Client {client_name.strip()} successfully registered to {firm_name}. "
                         f"Client Number: {client_number}"
                     )
@@ -2676,6 +2680,10 @@ elif menu == "Matters & Tasks":
 
     st.header("Matters & Tasks")
 
+    task_flash = st.session_state.pop("task_success_message", None)
+    if task_flash:
+        st.success(task_flash)
+
     st.markdown("""
     <div class="nx-soft">
         Matter Type tells Nexora what kind of legal file this is.
@@ -2895,8 +2903,8 @@ elif menu == "Matters & Tasks":
                                     str(due_date)
                                 )
 
-                                st.success(
-                                    f"Task {task_number} started."
+                                st.session_state.task_success_message = (
+                                    f"Task {task_number} created successfully."
                                 )
                                 st.rerun()
 
@@ -3226,6 +3234,10 @@ elif menu == "Billing & Invoices":
 
     st.header("Billing & Invoices")
 
+    invoice_flash = st.session_state.pop("invoice_success_message", None)
+    if invoice_flash:
+        st.success(invoice_flash)
+
     st.markdown("""
     <div class="nx-soft">
         Completed tasks remain Unbilled until selected for an invoice.
@@ -3281,7 +3293,20 @@ elif menu == "Billing & Invoices":
                     "This client has no completed unbilled tasks."
                 )
             else:
+                suggested_invoice_number = db.get_suggested_invoice_number(org_id)
+
                 with st.form("new_invoice_form"):
+
+                    invoice_number = st.text_input(
+                        "Invoice Number",
+                        value=suggested_invoice_number,
+                        placeholder="Example: BRIKJACT-2925",
+                        help=(
+                            "For the first firm-defined invoice, enter the full invoice number. "
+                            "After that, Nexora suggests the next number by incrementing only "
+                            "the trailing numeric sequence. You can still edit it before creating the invoice."
+                        )
+                    )
 
                     invoice_date = st.date_input(
                         "Invoice Date",
@@ -3336,7 +3361,9 @@ elif menu == "Billing & Invoices":
                         width="stretch"
                     ):
 
-                        if not selected_task_ids:
+                        if not invoice_number.strip():
+                            st.error("Invoice number is required.")
+                        elif not selected_task_ids:
                             st.error(
                                 "Select at least one completed task."
                             )
@@ -3350,7 +3377,8 @@ elif menu == "Billing & Invoices":
                                     user_id,
                                     notes.strip(),
                                     vat_rate,
-                                    payment_terms.strip()
+                                    payment_terms.strip(),
+                                    invoice_number.strip()
                                 )
 
                                 for task_id in selected_task_ids:
@@ -3365,7 +3393,7 @@ elif menu == "Billing & Invoices":
                                     invoice_id
                                 )
 
-                                st.success(
+                                st.session_state.invoice_success_message = (
                                     f"Invoice {invoice['invoice_number']} created successfully."
                                 )
                                 st.rerun()
